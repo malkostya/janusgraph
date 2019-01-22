@@ -609,6 +609,7 @@ public class Backend implements LockerProvider, AutoCloseable {
         m.put(StandardStoreManager.CASSANDRA_EMBEDDED, STORAGE_CONF_FILE);
         m.put(StandardStoreManager.CASSANDRA_THRIFT, STORAGE_HOSTS);
         m.put(StandardStoreManager.HBASE, STORAGE_HOSTS);
+        m.put(StandardStoreManager.COUCHBASE, STORAGE_HOSTS);
         //m.put(StandardStorageBackend.IN_MEMORY, null);
 
         //STORE_SHORTHAND_OPTIONS = Maps.immutableEnumMap(m);
