@@ -23,6 +23,7 @@ import org.apache.hadoop.hbase.filter.ColumnRangeFilter;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterList;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.janusgraph.diskstorage.keycolumnvalue.KeyColumnValueStore;
 import org.janusgraph.diskstorage.util.RecordIterator;
 import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.janusgraph.diskstorage.util.StaticArrayEntry;
@@ -68,7 +69,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
     private final ConnectionMask cnx;
 
-    CouchbaseKeyColumnValueStore(CouchbaseStoreManager storeManager, ConnectionMask cnx, String bucketName, String columnFamily, String storeName) {
+    CouchbaseKeyColumnValueStore(CouchbaseStoreManager storeManager, ConnectionMask cnx, String bucketName, String table) {
         this.storeManager = storeManager;
         this.cnx = cnx;
         this.bucketName = bucketName;

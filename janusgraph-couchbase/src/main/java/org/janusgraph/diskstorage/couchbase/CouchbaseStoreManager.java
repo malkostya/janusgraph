@@ -17,22 +17,17 @@ package org.janusgraph.diskstorage.couchbase;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.CouchbaseCluster;
+import com.couchbase.client.java.document.JsonDocument;
+import com.couchbase.client.java.document.json.JsonArray;
+import com.couchbase.client.java.document.json.JsonObject;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.BiMap;
-import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Sets;
-import org.apache.hadoop.hbase.*;
-import org.apache.hadoop.hbase.client.*;
-import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.util.Pair;
-import org.apache.hadoop.hbase.util.VersionInfo;
+import org.apache.commons.lang3.tuple.Pair;
 import org.janusgraph.core.JanusGraphException;
-import org.janusgraph.diskstorage.StaticBuffer;
+import org.janusgraph.diskstorage.*;
 import org.janusgraph.diskstorage.common.DistributedStoreManager;
-import org.janusgraph.diskstorage.configuration.ConfigElement;
 import org.janusgraph.diskstorage.configuration.ConfigNamespace;
 import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.Configuration;
@@ -45,14 +40,15 @@ import org.janusgraph.graphdb.configuration.PreInitializeConfigOptions;
 import org.janusgraph.util.system.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import rx.Observable;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.stream.Collectors;
 
-import static org.janusgraph.diskstorage.Backend.*;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.*;
 
 /**
@@ -66,7 +62,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     private static final Logger logger = LoggerFactory.getLogger(CouchbaseStoreManager.class);
 
     public static final ConfigNamespace COUCHBASE_NS =
-            new ConfigNamespace(GraphDatabaseConfiguration.STORAGE_NS, "couchbase", "Couchbase storage options");
+        new ConfigNamespace(GraphDatabaseConfiguration.STORAGE_NS, "couchbase", "Couchbase storage options");
 
     public static final ConfigOption<String> COUCHBASE_BUCKET =
         new ConfigOption<>(COUCHBASE_NS, "bucket",
@@ -77,48 +73,42 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             ConfigOption.Type.LOCAL, "janusgraph");
 
 
-
-
-
-
-
-
     public static final ConfigOption<Boolean> SHORT_CF_NAMES =
-            new ConfigOption<>(COUCHBASE_NS, "short-cf-names",
+        new ConfigOption<>(COUCHBASE_NS, "short-cf-names",
             "Whether to shorten the names of JanusGraph's column families to one-character mnemonics " +
-            "to conserve storage space", ConfigOption.Type.FIXED, true);
+                "to conserve storage space", ConfigOption.Type.FIXED, true);
 
     public static final String COMPRESSION_DEFAULT = "-DEFAULT-";
 
     public static final ConfigOption<String> COMPRESSION =
-            new ConfigOption<>(COUCHBASE_NS, "compression-algorithm",
+        new ConfigOption<>(COUCHBASE_NS, "compression-algorithm",
             "An HBase Compression.Algorithm enum string which will be applied to newly created column families. " +
-            "The compression algorithm must be installed and available on the HBase cluster.  JanusGraph cannot install " +
-            "and configure new compression algorithms on the HBase cluster by itself.",
+                "The compression algorithm must be installed and available on the HBase cluster.  JanusGraph cannot install " +
+                "and configure new compression algorithms on the HBase cluster by itself.",
             ConfigOption.Type.MASKABLE, "GZ");
 
     public static final ConfigOption<Boolean> SKIP_SCHEMA_CHECK =
-            new ConfigOption<>(COUCHBASE_NS, "skip-schema-check",
+        new ConfigOption<>(COUCHBASE_NS, "skip-schema-check",
             "Assume that JanusGraph's HBase table and column families already exist. " +
-            "When this is true, JanusGraph will not check for the existence of its table/CFs, " +
-            "nor will it attempt to create them under any circumstances.  This is useful " +
-            "when running JanusGraph without HBase admin privileges.",
+                "When this is true, JanusGraph will not check for the existence of its table/CFs, " +
+                "nor will it attempt to create them under any circumstances.  This is useful " +
+                "when running JanusGraph without HBase admin privileges.",
             ConfigOption.Type.MASKABLE, false);
 
     public static final ConfigOption<String> HBASE_SNAPSHOT =
-            new ConfigOption<>(COUCHBASE_NS, "snapshot-name",
+        new ConfigOption<>(COUCHBASE_NS, "snapshot-name",
             "The name of an exising HBase snapshot to be used by HBaseSnapshotInputFormat",
             ConfigOption.Type.LOCAL, "janusgraph-snapshot");
-    
+
     public static final ConfigOption<String> HBASE_SNAPSHOT_RESTORE_DIR =
-            new ConfigOption<>(COUCHBASE_NS, "snapshot-restore-dir",
+        new ConfigOption<>(COUCHBASE_NS, "snapshot-restore-dir",
             "The tempoary directory to be used by HBaseSnapshotInputFormat to restore a snapshot." +
-            " This directory should be on the same File System as the HBase root dir.",
+                " This directory should be on the same File System as the HBase root dir.",
             ConfigOption.Type.LOCAL, System.getProperty("java.io.tmpdir"));
 
     /**
      * Related bug fixed in 0.98.0, 0.94.7, 0.95.0:
-     *
+     * <p>
      * https://issues.apache.org/jira/browse/HBASE-8170
      */
     public static final int MIN_REGION_COUNT = 3;
@@ -129,7 +119,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      * JanusGraph connects to an HBase backend for the first time.
      */
     public static final ConfigOption<Integer> REGION_COUNT =
-            new ConfigOption<Integer>(COUCHBASE_NS, "region-count",
+        new ConfigOption<Integer>(COUCHBASE_NS, "region-count",
             "The number of initial regions set when creating JanusGraph's HBase table",
             ConfigOption.Type.MASKABLE, Integer.class, input -> null != input && MIN_REGION_COUNT <= input);
 
@@ -144,30 +134,30 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      * values for this setting:
      *
      * <ul>
-     *  <li>
-     *   <a href="https://hbase.apache.org/book/important_configurations.html#disable.splitting">2.5.2.7. Managed Splitting</a>:
-     *   <blockquote>
-     *    What's the optimal number of pre-split regions to create? Mileage will
-     *    vary depending upon your application. You could start low with 10
-     *    pre-split regions / server and watch as data grows over time. It's
-     *    better to err on the side of too little regions and rolling split later.
-     *   </blockquote>
-     *  </li>
-     *  <li>
-     *   <a href="https://hbase.apache.org/book/regions.arch.html">9.7 Regions</a>:
-     *   <blockquote>
-     *    In general, HBase is designed to run with a small (20-200) number of
-     *    relatively large (5-20Gb) regions per server... Typically you want to
-     *    keep your region count low on HBase for numerous reasons. Usually
-     *    right around 100 regions per RegionServer has yielded the best results.
-     *   </blockquote>
-     *  </li>
+     * <li>
+     * <a href="https://hbase.apache.org/book/important_configurations.html#disable.splitting">2.5.2.7. Managed Splitting</a>:
+     * <blockquote>
+     * What's the optimal number of pre-split regions to create? Mileage will
+     * vary depending upon your application. You could start low with 10
+     * pre-split regions / server and watch as data grows over time. It's
+     * better to err on the side of too little regions and rolling split later.
+     * </blockquote>
+     * </li>
+     * <li>
+     * <a href="https://hbase.apache.org/book/regions.arch.html">9.7 Regions</a>:
+     * <blockquote>
+     * In general, HBase is designed to run with a small (20-200) number of
+     * relatively large (5-20Gb) regions per server... Typically you want to
+     * keep your region count low on HBase for numerous reasons. Usually
+     * right around 100 regions per RegionServer has yielded the best results.
+     * </blockquote>
+     * </li>
      * </ul>
-     *
+     * <p>
      * These considerations may differ for other HBase implementations (e.g. MapR).
      */
     public static final ConfigOption<Integer> REGIONS_PER_SERVER =
-            new ConfigOption<>(COUCHBASE_NS, "regions-per-server",
+        new ConfigOption<>(COUCHBASE_NS, "regions-per-server",
             "The number of regions per regionserver to set when creating JanusGraph's HBase table",
             ConfigOption.Type.MASKABLE, Integer.class);
 
@@ -198,13 +188,12 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      * that are inconsistent with Apache's versioning convention. It may also be
      * useful to users who want to run against a new release of HBase that JanusGraph
      * doesn't yet officially support.
-     *
      */
     public static final ConfigOption<String> COMPAT_CLASS =
-            new ConfigOption<>(COUCHBASE_NS, "compat-class",
+        new ConfigOption<>(COUCHBASE_NS, "compat-class",
             "The package and class name of the HBaseCompat implementation. HBaseCompat masks version-specific HBase API differences. " +
-            "When this option is unset, JanusGraph calls HBase's VersionInfo.getVersion() and loads the matching compat class " +
-            "at runtime.  Setting this option forces JanusGraph to instead reflectively load and instantiate the specified class.",
+                "When this option is unset, JanusGraph calls HBase's VersionInfo.getVersion() and loads the matching compat class " +
+                "at runtime.  Setting this option forces JanusGraph to instead reflectively load and instantiate the specified class.",
             ConfigOption.Type.MASKABLE, String.class);
 
     public static final int PORT_DEFAULT = 2181;  // Not used. Just for the parent constructor.
@@ -212,7 +201,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     public static final TimestampProviders PREFERRED_TIMESTAMPS = TimestampProviders.MILLI;
 
     public static final ConfigNamespace HBASE_CONFIGURATION_NAMESPACE =
-            new ConfigNamespace(COUCHBASE_NS, "ext", "Overrides for hbase-{site,default}.xml options", true);
+        new ConfigNamespace(COUCHBASE_NS, "ext", "Overrides for hbase-{site,default}.xml options", true);
 
     private static final StaticBuffer FOUR_ZERO_BYTES = BufferUtil.zeroBuffer(4);
 
@@ -225,22 +214,18 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     private final ConcurrentMap<String, CouchbaseKeyColumnValueStore> openStores;
 
 
-
-
-
-
-    private final BiMap<String, String> shortCfNameMap;
-    private final String compression;
-    private final int regionCount;
-    private final int regionsPerServer;
-    private final ConnectionMask cnx;
-    private final boolean shortCfNames;
-    private final boolean skipSchemaCheck;
-    private final HBaseCompat compat;
-    // Cached return value of getDeployment() as requesting it can be expensive.
-    private Deployment deployment = null;
-
-    private final org.apache.hadoop.conf.Configuration hconf;
+//    private final BiMap<String, String> shortCfNameMap;
+//    private final String compression;
+//    private final int regionCount;
+//    private final int regionsPerServer;
+//    private final ConnectionMask cnx;
+//    private final boolean shortCfNames;
+//    private final boolean skipSchemaCheck;
+//    private final HBaseCompat compat;
+//    // Cached return value of getDeployment() as requesting it can be expensive.
+//    private Deployment deployment = null;
+//
+//    private final org.apache.hadoop.conf.Configuration hconf;
 
     private static final ConcurrentHashMap<CouchbaseStoreManager, Throwable> openManagers = new ConcurrentHashMap<>();
 
@@ -394,10 +379,10 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         Configuration c = GraphDatabaseConfiguration.buildGraphConfiguration();
 
         StandardStoreFeatures.Builder fb = new StandardStoreFeatures.Builder()
-                .orderedScan(true).unorderedScan(true).batchMutation(true)
-                .multiQuery(true).distributed(true).keyOrdered(true).storeTTL(true)
-                .cellTTL(false).timestamps(true).preferredTimestamps(PREFERRED_TIMESTAMPS)
-                .optimisticLocking(true).keyConsistent(c);
+            .orderedScan(true).unorderedScan(true).batchMutation(true)
+            .multiQuery(true).distributed(true).keyOrdered(true)
+            .cellTTL(true).timestamps(true).preferredTimestamps(PREFERRED_TIMESTAMPS)
+            .optimisticLocking(true).keyConsistent(c);
 
         try {
             fb.localKeyPartition(getDeployment() == Deployment.LOCAL);
@@ -408,74 +393,115 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         return fb.build();
     }
 
-
-
-
-
-
     @Override
-    public void mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> mutations, StoreTransaction txh) throws BackendException {
+    public void mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> batch, StoreTransaction txh) throws BackendException {
         final MaskedTimestamp commitTime = new MaskedTimestamp(txh);
-        // In case of an addition and deletion with identical timestamps, the
-        // deletion tombstone wins.
-        // http://hbase.apache.org/book/versions.html#d244e4250
-        final Map<StaticBuffer, Pair<List<Put>, Delete>> commandsPerKey =
-                convertToCommands(
-                        mutations,
-                        commitTime.getAdditionTime(times),
-                        commitTime.getDeletionTime(times));
+        final List<CouchbaseDocumentMutation> documentMutations = convertToDocumentMutations(batch);
+        final long currentTimeMillis = System.currentTimeMillis();
 
-        final List<Row> batch = new ArrayList<>(commandsPerKey.size()); // actual batch operation
+        Observable
+            .from(documentMutations)
+            .flatMap(docMutation -> {
+                JsonDocument document = bucket.get(docMutation.getDocumentId());
 
-        // convert sorted commands into representation required for 'batch' operation
-        for (Pair<List<Put>, Delete> commands : commandsPerKey.values()) {
-            if (commands.getFirst() != null && !commands.getFirst().isEmpty())
-                batch.addAll(commands.getFirst());
+                if (document == null)
+                    document = JsonDocument.create(
+                        docMutation.getDocumentId(),
+                        JsonObject.create()
+                            .put("table", docMutation.getTable())
+                            .put("columns", JsonArray.create())
+                    );
 
-            if (commands.getSecond() != null)
-                batch.add(commands.getSecond());
-        }
+                Map<String, CouchbaseColumn> columns = getColumnsFromDocument(document, currentTimeMillis);
+                KCVMutation mutation = docMutation.getMutation();
 
-        try {
-            TableMask table = null;
+                if (mutation.hasAdditions()) {
+                    for (Entry e : mutation.getAdditions()) {
+                        Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
+                        long expired = null != ttl && ttl > 0 ? currentTimeMillis + ttl : 0;
 
-            try {
-                table = cnx.getTable(bucketName);
-                table.batch(batch, new Object[batch.size()]);
-            } finally {
-                IOUtils.closeQuietly(table);
-            }
-        } catch (IOException | InterruptedException e) {
-            throw new TemporaryBackendException(e);
-        }
+                        columns.put(e.getColumnAs(CouchbaseColumnConverter.INSTANCE), new CouchbaseColumn(
+                            e.getValueAs(CouchbaseColumnConverter.INSTANCE), expired));
+                    }
+                }
+
+                if (mutation.hasDeletions()) {
+                    for (StaticBuffer b : mutation.getDeletions())
+                        columns.remove(b.as(CouchbaseColumnConverter.INSTANCE));
+                }
+
+                if (!columns.isEmpty()) {
+                    updateColumns(document, columns);
+                    return bucket.async().upsert(document); // TODO add PersistTo and ReplicateTo
+                } else
+                    return bucket.async().remove(document); // TODO add PersistTo and ReplicateTo
+            })
+            .last()
+            .toBlocking()
+            .single();
 
         sleepAfterWrite(txh, commitTime);
     }
 
-    @Override
-    public KeyColumnValueStore openDatabase(String longName, StoreMetaData.Container metaData) throws BackendException {
-        // HBase does not support retrieving cell-level TTL by the client.
-        Preconditions.checkArgument(!storageConfig.has(GraphDatabaseConfiguration.STORE_META_TTL, longName)
-            || !storageConfig.get(GraphDatabaseConfiguration.STORE_META_TTL, longName));
+    private void updateColumns(JsonDocument document, Map<String, CouchbaseColumn> columns) {
+        final List<JsonObject> columnsList = columns.entrySet().stream().map(entry ->
+            JsonObject.create()
+                .put("key", entry.getKey())
+                .put("value", entry.getValue().getValue())
+                .put("expired", entry.getValue().getExpired())
+        ).collect(Collectors.toList());
 
-        CouchbaseKeyColumnValueStore store = openStores.get(longName);
+        document.content().put("columns", JsonArray.from(columnsList));
+    }
+
+    private Map<String, CouchbaseColumn> getColumnsFromDocument(JsonDocument document, long currentTimeMillis) {
+        final Map<String, CouchbaseColumn> columns = new HashMap<>();
+        final Iterator it = document.content().getArray("columns").iterator();
+
+        while (it.hasNext()) {
+            JsonObject column = (JsonObject) it.next();
+            long expired = column.getLong("expired");
+            if (expired == 0 || expired > currentTimeMillis)
+                columns.put(column.getString("key"), new CouchbaseColumn(column.getString("value"),
+                    expired));
+        }
+
+        return columns;
+    }
+
+    private List<CouchbaseDocumentMutation> convertToDocumentMutations(Map<String, Map<StaticBuffer, KCVMutation>> batch) {
+        List<CouchbaseDocumentMutation> documentMutations = new ArrayList<>();
+
+        for (Map.Entry<String, Map<StaticBuffer, KCVMutation>> batchEntry : batch.entrySet()) {
+            String table = batchEntry.getKey();
+            Preconditions.checkArgument(openStores.containsKey(table), "Table cannot be found: " + table);
+
+            Map<StaticBuffer, KCVMutation> mutations = batchEntry.getValue();
+            for (Map.Entry<StaticBuffer, KCVMutation> ent : mutations.entrySet()) {
+                KCVMutation mutation = ent.getValue();
+                String id = convertToUtf8(ent.getKey());
+                documentMutations.add(new CouchbaseDocumentMutation(table, id, mutation));
+            }
+        }
+
+        return documentMutations;
+    }
+
+    private String convertToUtf8(StaticBuffer buffer) {
+
+    }
+
+    @Override
+    public KeyColumnValueStore openDatabase(String name, StoreMetaData.Container metaData) throws BackendException {
+        CouchbaseKeyColumnValueStore store = openStores.get(name);
 
         if (store == null) {
-            final String cfName = getCfNameForStoreName(longName);
+            CouchbaseKeyColumnValueStore newStore = new CouchbaseKeyColumnValueStore(this, cnx, bucketName,
+                name);
 
-            CouchbaseKeyColumnValueStore newStore = new CouchbaseKeyColumnValueStore(this, cnx, bucketName, cfName, longName);
-
-            store = openStores.putIfAbsent(longName, newStore); // nothing bad happens if we loose to other thread
+            store = openStores.putIfAbsent(name, newStore);
 
             if (store == null) {
-                if (!skipSchemaCheck) {
-                    int cfTTLInSeconds = -1;
-                    if (metaData.contains(StoreMetaData.TTL)) {
-                        cfTTLInSeconds = metaData.get(StoreMetaData.TTL);
-                    }
-                    ensureColumnFamilyExists(bucketName, cfName, cfTTLInSeconds);
-                }
-
                 store = newStore;
             }
         }
@@ -493,6 +519,16 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         return bucketName;
     }
 
+
+
+
+
+
+
+
+
+
+
     /**
      * Deletes the specified table with all its columns.
      * ATTENTION: Invoking this method will delete the table if it exists and therefore causes data loss.
@@ -505,8 +541,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             } else {
                 adm.clearTable(bucketName, times.getTime(times.getTime()));
             }
-        } catch (IOException e)
-        {
+        } catch (IOException e) {
             throw new TemporaryBackendException(e);
         }
     }
@@ -559,7 +594,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      * both keys to make each at least 4 bytes long, and the end key is then
      * incremented as described in the last bullet point.</li>
      * </ul>
-     *
+     * <p>
      * After iterating over the parameter map, this method checks that it either
      * saw no entries with null keys, one entry with a null start key and a
      * different entry with a null end key, or one entry with both start and end
@@ -580,7 +615,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             HRegionInfo regionInfo = location.getRegionInfo();
             ServerName serverName = location.getServerName();
             byte startKey[] = regionInfo.getStartKey();
-            byte endKey[]   = regionInfo.getEndKey();
+            byte endKey[] = regionInfo.getEndKey();
 
             if (0 == startKey.length) {
                 startKey = null;
@@ -656,7 +691,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         System.arraycopy(dataToPad, 0, padded, 0, dataToPad.length);
 
         for (int i = dataToPad.length; i < padded.length; i++)
-            padded[i] = (byte)0;
+            padded[i] = (byte) 0;
 
         return padded;
     }
@@ -701,8 +736,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                             SHORT_CF_NAMES.getName(), tableName, longCFName);
                         logger.warn("Check {} configuration.", SHORT_CF_NAMES.getName());
                     }
-                }
-                else if (!shortCfNames && initialCFName.equals(SYSTEM_PROPERTIES_STORE_NAME)) {
+                } else if (!shortCfNames && initialCFName.equals(SYSTEM_PROPERTIES_STORE_NAME)) {
                     String shortCFName = shortCfNameMap.get(initialCFName);
                     if (desc.getFamily(Bytes.toBytes(shortCFName)) != null) {
                         logger.warn("Configuration {}=false, but the table \"{}\" already has column family with short name \"{}\".",
@@ -736,7 +770,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         if (MIN_REGION_COUNT <= (count = regionCount)) {
             src = "region count configuration";
         } else if (0 < regionsPerServer &&
-                   MIN_REGION_COUNT <= (count = regionsPerServer * adm.getEstimatedRegionServerCount())) {
+            MIN_REGION_COUNT <= (count = regionsPerServer * adm.getEstimatedRegionServerCount())) {
             src = "ClusterStatus server count";
         } else {
             count = -1;
@@ -769,7 +803,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      */
     private byte[] getStartKey(int regionCount) {
         ByteBuffer regionWidth = ByteBuffer.allocate(4);
-        regionWidth.putInt((int)(((1L << 32) - 1L) / regionCount)).flip();
+        regionWidth.putInt((int) (((1L << 32) - 1L) / regionCount)).flip();
         return StaticArrayBuffer.of(regionWidth).getBytes(0, 4);
     }
 
@@ -778,7 +812,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      */
     private byte[] getEndKey(int regionCount) {
         ByteBuffer regionWidth = ByteBuffer.allocate(4);
-        regionWidth.putInt((int)(((1L << 32) - 1L) / regionCount * (regionCount - 1))).flip();
+        regionWidth.putInt((int) (((1L << 32) - 1L) / regionCount * (regionCount - 1))).flip();
         return StaticArrayBuffer.of(regionWidth).getBytes(0, 4);
     }
 
@@ -850,11 +884,11 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      * @return Commands sorted by key converted from JanusGraph internal representation.
      * @throws org.janusgraph.diskstorage.PermanentBackendException
      */
-     @VisibleForTesting
-     Map<StaticBuffer, Pair<List<Put>, Delete>> convertToCommands(Map<String, Map<StaticBuffer, KCVMutation>> mutations,
-                                                                   final long putTimestamp,
-                                                                   final long delTimestamp) throws PermanentBackendException {
-        // A map of rowkey to commands (list of Puts, Delete)
+    @VisibleForTesting
+    Map<StaticBuffer, Pair<List<Put>, Delete>> convertToCommands(Map<String, Map<StaticBuffer, KCVMutation>> mutations,
+                                                                 final long putTimestamp,
+                                                                 final long delTimestamp) throws PermanentBackendException {
+// A map of rowkey to commands (list of Puts, Delete)
         final Map<StaticBuffer, Pair<List<Put>, Delete>> commandsPerKey = new HashMap<>();
 
         for (Map.Entry<String, Map<StaticBuffer, KCVMutation>> entry : mutations.entrySet()) {
@@ -872,7 +906,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                 // create the holder for a particular rowkey
                 if (commands == null) {
                     commands = new Pair<>();
-                    // List of all the Puts for this rowkey, including the ones without TTL and with TTL.
+// List of all the Puts for this rowkey, including the ones without TTL and with TTL.
                     final List<Put> putList = new ArrayList<>();
                     commands.setFirst(putList);
                     commandsPerKey.put(m.getKey(), commands);
@@ -892,20 +926,20 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                 }
 
                 if (mutation.hasAdditions()) {
-                    // All the entries (column cells) with the rowkey use this one Put, except the ones with TTL.
+// All the entries (column cells) with the rowkey use this one Put, except the ones with TTL.
                     final Put putColumnsWithoutTtl = new Put(key, putTimestamp);
                     // At the end of this loop, there will be one Put entry in the commands.getFirst() list that
                     // contains all additions without TTL set, and possible multiple Put entries for columns
                     // that have TTL set.
                     for (Entry e : mutation.getAdditions()) {
 
-                        // Deal with TTL within the entry (column cell) first
-                        // HBase cell level TTL is actually set at the Mutation/Put level.
-                        // Therefore we need to construct a new Put for each entry (column cell) with TTL.
-                        // We can not combine them because column cells within the same rowkey may:
-                        // 1. have no TTL
-                        // 2. have TTL
-                        // 3. have different TTL
+// Deal with TTL within the entry (column cell) first
+// HBase cell level TTL is actually set at the Mutation/Put level.
+// Therefore we need to construct a new Put for each entry (column cell) with TTL.
+// We can not combine them because column cells within the same rowkey may:
+// 1. have no TTL
+// 2. have TTL
+// 3. have different TTL
                         final Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
                         if (null != ttl && ttl > 0) {
                             // Create a new Put
@@ -934,8 +968,8 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     }
 
     private void addColumnToPut(Put p, byte[] cfName, long putTimestamp, Entry e) {
-      p.addColumn(cfName, e.getColumnAs(StaticBuffer.ARRAY_FACTORY), putTimestamp,
-          e.getValueAs(StaticBuffer.ARRAY_FACTORY));
+        p.addColumn(cfName, e.getColumnAs(StaticBuffer.ARRAY_FACTORY), putTimestamp,
+            e.getValueAs(StaticBuffer.ARRAY_FACTORY));
     }
 
     private String getCfNameForStoreName(String storeName) throws PermanentBackendException {
