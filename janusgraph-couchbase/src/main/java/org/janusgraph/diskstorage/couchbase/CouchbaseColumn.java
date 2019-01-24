@@ -2,18 +2,18 @@ package org.janusgraph.diskstorage.couchbase;
 
 public class CouchbaseColumn {
     private String value;
-    private long expired;
+    private long expire;
 
-    public CouchbaseColumn(String value, long expired) {
+    public CouchbaseColumn(String value, long expire) {
         this.value = value;
-        this.expired = expired;
+        this.expire = expire;
     }
 
     public String getValue() {
         return value;
     }
 
-    public long getExpired() {
-        return expired;
+    public long getExpire() {
+        return expire;
     }
 }

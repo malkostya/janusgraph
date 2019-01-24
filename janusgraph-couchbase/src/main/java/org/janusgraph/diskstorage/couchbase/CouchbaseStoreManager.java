@@ -20,41 +20,30 @@ import com.couchbase.client.java.CouchbaseCluster;
 import com.couchbase.client.java.document.JsonDocument;
 import com.couchbase.client.java.document.json.JsonArray;
 import com.couchbase.client.java.document.json.JsonObject;
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.BiMap;
-import com.google.common.collect.ImmutableMap;
-import org.apache.commons.lang3.tuple.Pair;
-import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.diskstorage.*;
 import org.janusgraph.diskstorage.common.DistributedStoreManager;
 import org.janusgraph.diskstorage.configuration.ConfigNamespace;
 import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.keycolumnvalue.*;
-import org.janusgraph.diskstorage.util.BufferUtil;
-import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.janusgraph.diskstorage.util.time.TimestampProviders;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.configuration.PreInitializeConfigOptions;
-import org.janusgraph.util.system.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import rx.Observable;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 
-import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.*;
+import static com.couchbase.client.java.query.Delete.deleteFrom;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GRAPH_NAME;
 
 /**
- * Storage Manager for HBase
- *
- * @author Dan LaRocque &lt;dalaro@hopcount.org&gt;
+ * Storage Manager for Couchbase
  */
 @PreInitializeConfigOptions
 public class CouchbaseStoreManager extends DistributedStoreManager implements KeyColumnValueStoreManager {
@@ -72,138 +61,9 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                 " to that value.",
             ConfigOption.Type.LOCAL, "janusgraph");
 
-
-    public static final ConfigOption<Boolean> SHORT_CF_NAMES =
-        new ConfigOption<>(COUCHBASE_NS, "short-cf-names",
-            "Whether to shorten the names of JanusGraph's column families to one-character mnemonics " +
-                "to conserve storage space", ConfigOption.Type.FIXED, true);
-
-    public static final String COMPRESSION_DEFAULT = "-DEFAULT-";
-
-    public static final ConfigOption<String> COMPRESSION =
-        new ConfigOption<>(COUCHBASE_NS, "compression-algorithm",
-            "An HBase Compression.Algorithm enum string which will be applied to newly created column families. " +
-                "The compression algorithm must be installed and available on the HBase cluster.  JanusGraph cannot install " +
-                "and configure new compression algorithms on the HBase cluster by itself.",
-            ConfigOption.Type.MASKABLE, "GZ");
-
-    public static final ConfigOption<Boolean> SKIP_SCHEMA_CHECK =
-        new ConfigOption<>(COUCHBASE_NS, "skip-schema-check",
-            "Assume that JanusGraph's HBase table and column families already exist. " +
-                "When this is true, JanusGraph will not check for the existence of its table/CFs, " +
-                "nor will it attempt to create them under any circumstances.  This is useful " +
-                "when running JanusGraph without HBase admin privileges.",
-            ConfigOption.Type.MASKABLE, false);
-
-    public static final ConfigOption<String> HBASE_SNAPSHOT =
-        new ConfigOption<>(COUCHBASE_NS, "snapshot-name",
-            "The name of an exising HBase snapshot to be used by HBaseSnapshotInputFormat",
-            ConfigOption.Type.LOCAL, "janusgraph-snapshot");
-
-    public static final ConfigOption<String> HBASE_SNAPSHOT_RESTORE_DIR =
-        new ConfigOption<>(COUCHBASE_NS, "snapshot-restore-dir",
-            "The tempoary directory to be used by HBaseSnapshotInputFormat to restore a snapshot." +
-                " This directory should be on the same File System as the HBase root dir.",
-            ConfigOption.Type.LOCAL, System.getProperty("java.io.tmpdir"));
-
-    /**
-     * Related bug fixed in 0.98.0, 0.94.7, 0.95.0:
-     * <p>
-     * https://issues.apache.org/jira/browse/HBASE-8170
-     */
-    public static final int MIN_REGION_COUNT = 3;
-
-    /**
-     * The total number of HBase regions to create with JanusGraph's table. This
-     * setting only effects table creation; this normally happens just once when
-     * JanusGraph connects to an HBase backend for the first time.
-     */
-    public static final ConfigOption<Integer> REGION_COUNT =
-        new ConfigOption<Integer>(COUCHBASE_NS, "region-count",
-            "The number of initial regions set when creating JanusGraph's HBase table",
-            ConfigOption.Type.MASKABLE, Integer.class, input -> null != input && MIN_REGION_COUNT <= input);
-
-    /**
-     * This setting is used only when {@link #REGION_COUNT} is unset.
-     * <p>
-     * If JanusGraph's HBase table does not exist, then it will be created with total
-     * region count = (number of servers reported by ClusterStatus) * (this
-     * value).
-     * <p>
-     * The Apache HBase manual suggests an order-of-magnitude range of potential
-     * values for this setting:
-     *
-     * <ul>
-     * <li>
-     * <a href="https://hbase.apache.org/book/important_configurations.html#disable.splitting">2.5.2.7. Managed Splitting</a>:
-     * <blockquote>
-     * What's the optimal number of pre-split regions to create? Mileage will
-     * vary depending upon your application. You could start low with 10
-     * pre-split regions / server and watch as data grows over time. It's
-     * better to err on the side of too little regions and rolling split later.
-     * </blockquote>
-     * </li>
-     * <li>
-     * <a href="https://hbase.apache.org/book/regions.arch.html">9.7 Regions</a>:
-     * <blockquote>
-     * In general, HBase is designed to run with a small (20-200) number of
-     * relatively large (5-20Gb) regions per server... Typically you want to
-     * keep your region count low on HBase for numerous reasons. Usually
-     * right around 100 regions per RegionServer has yielded the best results.
-     * </blockquote>
-     * </li>
-     * </ul>
-     * <p>
-     * These considerations may differ for other HBase implementations (e.g. MapR).
-     */
-    public static final ConfigOption<Integer> REGIONS_PER_SERVER =
-        new ConfigOption<>(COUCHBASE_NS, "regions-per-server",
-            "The number of regions per regionserver to set when creating JanusGraph's HBase table",
-            ConfigOption.Type.MASKABLE, Integer.class);
-
-    /**
-     * If this key is present in either the JVM system properties or the process
-     * environment (checked in the listed order, first hit wins), then its value
-     * must be the full package and class name of an implementation of
-     * {@link HBaseCompat} that has a no-arg public constructor.
-     * <p>
-     * When this <b>is not</b> set, JanusGraph attempts to automatically detect the
-     * HBase runtime version by calling {@link VersionInfo#getVersion()}. JanusGraph
-     * then checks the returned version string against a hard-coded list of
-     * supported version prefixes and instantiates the associated compat layer
-     * if a match is found.
-     * <p>
-     * When this <b>is</b> set, JanusGraph will not call
-     * {@code VersionInfo.getVersion()} or read its hard-coded list of supported
-     * version prefixes. JanusGraph will instead attempt to instantiate the class
-     * specified (via the no-arg constructor which must exist) and then attempt
-     * to cast it to HBaseCompat and use it as such. JanusGraph will assume the
-     * supplied implementation is compatible with the runtime HBase version and
-     * make no attempt to verify that assumption.
-     * <p>
-     * Setting this key incorrectly could cause runtime exceptions at best or
-     * silent data corruption at worst. This setting is intended for users
-     * running exotic HBase implementations that don't support VersionInfo or
-     * implementations which return values from {@code VersionInfo.getVersion()}
-     * that are inconsistent with Apache's versioning convention. It may also be
-     * useful to users who want to run against a new release of HBase that JanusGraph
-     * doesn't yet officially support.
-     */
-    public static final ConfigOption<String> COMPAT_CLASS =
-        new ConfigOption<>(COUCHBASE_NS, "compat-class",
-            "The package and class name of the HBaseCompat implementation. HBaseCompat masks version-specific HBase API differences. " +
-                "When this option is unset, JanusGraph calls HBase's VersionInfo.getVersion() and loads the matching compat class " +
-                "at runtime.  Setting this option forces JanusGraph to instead reflectively load and instantiate the specified class.",
-            ConfigOption.Type.MASKABLE, String.class);
-
     public static final int PORT_DEFAULT = 2181;  // Not used. Just for the parent constructor.
 
     public static final TimestampProviders PREFERRED_TIMESTAMPS = TimestampProviders.MILLI;
-
-    public static final ConfigNamespace HBASE_CONFIGURATION_NAMESPACE =
-        new ConfigNamespace(COUCHBASE_NS, "ext", "Overrides for hbase-{site,default}.xml options", true);
-
-    private static final StaticBuffer FOUR_ZERO_BYTES = BufferUtil.zeroBuffer(4);
 
     // Immutable instance fields
     private final String bucketName;
@@ -213,19 +73,6 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     // Mutable instance state
     private final ConcurrentMap<String, CouchbaseKeyColumnValueStore> openStores;
 
-
-//    private final BiMap<String, String> shortCfNameMap;
-//    private final String compression;
-//    private final int regionCount;
-//    private final int regionsPerServer;
-//    private final ConnectionMask cnx;
-//    private final boolean shortCfNames;
-//    private final boolean skipSchemaCheck;
-//    private final HBaseCompat compat;
-//    // Cached return value of getDeployment() as requesting it can be expensive.
-//    private Deployment deployment = null;
-//
-//    private final org.apache.hadoop.conf.Configuration hconf;
 
     private static final ConcurrentHashMap<CouchbaseStoreManager, Throwable> openManagers = new ConcurrentHashMap<>();
 
@@ -319,20 +166,6 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         openStores = new ConcurrentHashMap<>();
     }
 
-//    public static BiMap<String, String> createShortCfMap(Configuration config) {
-//        return ImmutableBiMap.<String, String>builder()
-//                .put(INDEXSTORE_NAME, "g")
-//                .put(INDEXSTORE_NAME + LOCK_STORE_SUFFIX, "h")
-//                .put(config.get(IDS_STORE_NAME), "i")
-//                .put(EDGESTORE_NAME, "e")
-//                .put(EDGESTORE_NAME + LOCK_STORE_SUFFIX, "f")
-//                .put(SYSTEM_PROPERTIES_STORE_NAME, "s")
-//                .put(SYSTEM_PROPERTIES_STORE_NAME + LOCK_STORE_SUFFIX, "t")
-//                .put(SYSTEM_MGMT_LOG_NAME, "m")
-//                .put(SYSTEM_TX_LOG_NAME, "l")
-//                .build();
-//    }
-
     @Override
     public Deployment getDeployment() {
         return Deployment.REMOTE;
@@ -402,6 +235,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         Observable
             .from(documentMutations)
             .flatMap(docMutation -> {
+                // we should get whole document to clean up expired columns otherwise we could mutate document's fragments
                 JsonDocument document = bucket.get(docMutation.getDocumentId());
 
                 if (document == null)
@@ -418,10 +252,10 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                 if (mutation.hasAdditions()) {
                     for (Entry e : mutation.getAdditions()) {
                         Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
-                        long expired = null != ttl && ttl > 0 ? currentTimeMillis + ttl : 0;
+                        long expire = null != ttl && ttl > 0 ? currentTimeMillis + ttl : 0;
 
                         columns.put(e.getColumnAs(CouchbaseColumnConverter.INSTANCE), new CouchbaseColumn(
-                            e.getValueAs(CouchbaseColumnConverter.INSTANCE), expired));
+                            e.getValueAs(CouchbaseColumnConverter.INSTANCE), expire));
                     }
                 }
 
@@ -448,7 +282,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             JsonObject.create()
                 .put("key", entry.getKey())
                 .put("value", entry.getValue().getValue())
-                .put("expired", entry.getValue().getExpired())
+                .put("expire", entry.getValue().getExpire())
         ).collect(Collectors.toList());
 
         document.content().put("columns", JsonArray.from(columnsList));
@@ -460,10 +294,10 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
         while (it.hasNext()) {
             JsonObject column = (JsonObject) it.next();
-            long expired = column.getLong("expired");
-            if (expired == 0 || expired > currentTimeMillis)
+            long expire = column.getLong("expire");
+            if (expire == 0 || expire > currentTimeMillis)
                 columns.put(column.getString("key"), new CouchbaseColumn(column.getString("value"),
-                    expired));
+                    expire));
         }
 
         return columns;
@@ -479,7 +313,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             Map<StaticBuffer, KCVMutation> mutations = batchEntry.getValue();
             for (Map.Entry<StaticBuffer, KCVMutation> ent : mutations.entrySet()) {
                 KCVMutation mutation = ent.getValue();
-                String id = convertToUtf8(ent.getKey());
+                String id = convertToString(ent.getKey());
                 documentMutations.add(new CouchbaseDocumentMutation(table, id, mutation));
             }
         }
@@ -487,8 +321,9 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         return documentMutations;
     }
 
-    private String convertToUtf8(StaticBuffer buffer) {
-
+    private String convertToString(StaticBuffer buffer) {
+        final byte[] array = buffer.getBytes(0, buffer.length());
+        return CouchbaseColumnConverter.INSTANCE.toString(array);
     }
 
     @Override
@@ -496,7 +331,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         CouchbaseKeyColumnValueStore store = openStores.get(name);
 
         if (store == null) {
-            CouchbaseKeyColumnValueStore newStore = new CouchbaseKeyColumnValueStore(this, cnx, bucketName,
+            CouchbaseKeyColumnValueStore newStore = new CouchbaseKeyColumnValueStore(this, bucketName,
                 name);
 
             store = openStores.putIfAbsent(name, newStore);
@@ -519,469 +354,26 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         return bucketName;
     }
 
-
-
-
-
-
-
-
-
-
-
     /**
      * Deletes the specified table with all its columns.
-     * ATTENTION: Invoking this method will delete the table if it exists and therefore causes data loss.
      */
     @Override
     public void clearStorage() throws BackendException {
-        try (AdminMask adm = getAdminInterface()) {
-            if (this.storageConfig.get(DROP_ON_CLEAR)) {
-                adm.dropTable(bucketName);
-            } else {
-                adm.clearTable(bucketName, times.getTime(times.getTime()));
-            }
-        } catch (IOException e) {
+        try {
+            bucket.query(deleteFrom(bucketName));
+        } catch (Exception e) {
             throw new TemporaryBackendException(e);
         }
     }
 
     @Override
     public boolean exists() throws BackendException {
-        try (final AdminMask adm = getAdminInterface()) {
-            return adm.tableExists(bucketName);
-        } catch (IOException e) {
-            throw new TemporaryBackendException(e);
-        }
+        return true;
     }
 
     @Override
     public List<KeyRange> getLocalKeyPartition() throws BackendException {
         throw new UnsupportedOperationException();
-    }
-
-    /**
-     * Given a map produced by {@link HTable#getRegionLocations()}, transform
-     * each key from an {@link HRegionInfo} to a {@link KeyRange} expressing the
-     * region's start and end key bounds using JanusGraph-partitioning-friendly
-     * conventions (start inclusive, end exclusive, zero bytes appended where
-     * necessary to make all keys at least 4 bytes long).
-     * <p/>
-     * This method iterates over the entries in its map parameter and performs
-     * the following conditional conversions on its keys. "Require" below means
-     * either a {@link Preconditions} invocation or an assertion. HRegionInfo
-     * sometimes returns start and end keys of zero length; this method replaces
-     * zero length keys with null before doing any of the checks described
-     * below. The parameter map and the values it contains are only read and
-     * never modified.
-     *
-     * <ul>
-     * <li>If an entry's HRegionInfo has null start and end keys, then first
-     * require that the parameter map is a singleton, and then return a
-     * single-entry map whose {@code KeyRange} has start and end buffers that
-     * are both four bytes of zeros.</li>
-     * <li>If the entry has a null end key (but non-null start key), put an
-     * equivalent entry in the result map with a start key identical to the
-     * input, except that zeros are appended to values less than 4 bytes long,
-     * and an end key that is four bytes of zeros.
-     * <li>If the entry has a null start key (but non-null end key), put an
-     * equivalent entry in the result map where the start key is four bytes of
-     * zeros, and the end key has zeros appended, if necessary, to make it at
-     * least 4 bytes long, after which one is added to the padded value in
-     * unsigned 32-bit arithmetic with overflow allowed.</li>
-     * <li>Any entry which matches none of the above criteria results in an
-     * equivalent entry in the returned map, except that zeros are appended to
-     * both keys to make each at least 4 bytes long, and the end key is then
-     * incremented as described in the last bullet point.</li>
-     * </ul>
-     * <p>
-     * After iterating over the parameter map, this method checks that it either
-     * saw no entries with null keys, one entry with a null start key and a
-     * different entry with a null end key, or one entry with both start and end
-     * keys null. If any null keys are observed besides these three cases, the
-     * method will die with a precondition failure.
-     *
-     * @param locations A list of HRegionInfo
-     * @return JanusGraph-friendly expression of each region's rowkey boundaries
-     */
-    private Map<KeyRange, ServerName> normalizeKeyBounds(List<HRegionLocation> locations) {
-
-        HRegionLocation nullStart = null;
-        HRegionLocation nullEnd = null;
-
-        ImmutableMap.Builder<KeyRange, ServerName> b = ImmutableMap.builder();
-
-        for (HRegionLocation location : locations) {
-            HRegionInfo regionInfo = location.getRegionInfo();
-            ServerName serverName = location.getServerName();
-            byte startKey[] = regionInfo.getStartKey();
-            byte endKey[] = regionInfo.getEndKey();
-
-            if (0 == startKey.length) {
-                startKey = null;
-                logger.trace("Converted zero-length HBase startKey byte array to null");
-            }
-
-            if (0 == endKey.length) {
-                endKey = null;
-                logger.trace("Converted zero-length HBase endKey byte array to null");
-            }
-
-            if (null == startKey && null == endKey) {
-                Preconditions.checkState(1 == locations.size());
-                logger.debug("HBase table {} has a single region {}", bucketName, regionInfo);
-                // Choose arbitrary shared value = startKey = endKey
-                return b.put(new KeyRange(FOUR_ZERO_BYTES, FOUR_ZERO_BYTES), serverName).build();
-            } else if (null == startKey) {
-                logger.debug("Found HRegionInfo with null startKey on server {}: {}", serverName, regionInfo);
-                Preconditions.checkState(null == nullStart);
-                nullStart = location;
-                // I thought endBuf would be inclusive from the HBase javadoc, but in practice it is exclusive
-                StaticBuffer endBuf = StaticArrayBuffer.of(zeroExtend(endKey));
-                // Replace null start key with zeroes
-                b.put(new KeyRange(FOUR_ZERO_BYTES, endBuf), serverName);
-            } else if (null == endKey) {
-                logger.debug("Found HRegionInfo with null endKey on server {}: {}", serverName, regionInfo);
-                Preconditions.checkState(null == nullEnd);
-                nullEnd = location;
-                // Replace null end key with zeroes
-                b.put(new KeyRange(StaticArrayBuffer.of(zeroExtend(startKey)), FOUR_ZERO_BYTES), serverName);
-            } else {
-                // Convert HBase's inclusive end keys into exclusive JanusGraph end keys
-                StaticBuffer startBuf = StaticArrayBuffer.of(zeroExtend(startKey));
-                StaticBuffer endBuf = StaticArrayBuffer.of(zeroExtend(endKey));
-
-                KeyRange kr = new KeyRange(startBuf, endBuf);
-                b.put(kr, serverName);
-                logger.debug("Found HRegionInfo with non-null end and start keys on server {}: {}", serverName, regionInfo);
-            }
-        }
-
-        // Require either no null key bounds or a pair of them
-        Preconditions.checkState((null == nullStart) == (null == nullEnd));
-
-        // Check that every key in the result is at least 4 bytes long
-        Map<KeyRange, ServerName> result = b.build();
-        for (KeyRange kr : result.keySet()) {
-            Preconditions.checkState(4 <= kr.getStart().length());
-            Preconditions.checkState(4 <= kr.getEnd().length());
-        }
-
-        return result;
-    }
-
-    /**
-     * If the parameter is shorter than 4 bytes, then create and return a new 4
-     * byte array with the input array's bytes followed by zero bytes. Otherwise
-     * return the parameter.
-     *
-     * @param dataToPad non-null but possibly zero-length byte array
-     * @return either the parameter or a new array
-     */
-    private byte[] zeroExtend(byte[] dataToPad) {
-        assert null != dataToPad;
-
-        final int targetLength = 4;
-
-        if (targetLength <= dataToPad.length)
-            return dataToPad;
-
-        byte padded[] = new byte[targetLength];
-
-        System.arraycopy(dataToPad, 0, padded, 0, dataToPad.length);
-
-        for (int i = dataToPad.length; i < padded.length; i++)
-            padded[i] = (byte) 0;
-
-        return padded;
-    }
-
-    public static String shortenCfName(BiMap<String, String> shortCfNameMap, String longName) throws PermanentBackendException {
-        final String s;
-        if (shortCfNameMap.containsKey(longName)) {
-            s = shortCfNameMap.get(longName);
-            Preconditions.checkNotNull(s);
-            logger.debug("Substituted default CF name \"{}\" with short form \"{}\" to reduce HBase KeyValue size", longName, s);
-        } else {
-            if (shortCfNameMap.containsValue(longName)) {
-                String fmt = "Must use CF long-form name \"%s\" instead of the short-form name \"%s\" when configured with %s=true";
-                String msg = String.format(fmt, shortCfNameMap.inverse().get(longName), longName, SHORT_CF_NAMES.getName());
-                throw new PermanentBackendException(msg);
-            }
-            s = longName;
-            logger.debug("Kept default CF name \"{}\" because it has no associated short form", s);
-        }
-        return s;
-    }
-
-    private HTableDescriptor ensureTableExists(String tableName, String initialCFName, int ttlInSeconds) throws BackendException {
-        AdminMask adm = null;
-
-        HTableDescriptor desc;
-
-        try { // Create our table, if necessary
-            adm = getAdminInterface();
-            /*
-             * Some HBase versions / implementations respond badly to attempts to create a
-             * table without at least one CF. See #661. Creating a CF along with
-             * the table avoids HBase carping.
-             */
-            if (adm.tableExists(tableName)) {
-                desc = adm.getTableDescriptor(tableName);
-                // Check and warn if long and short cf names are interchangeably used for the same table.
-                if (shortCfNames && initialCFName.equals(shortCfNameMap.get(SYSTEM_PROPERTIES_STORE_NAME))) {
-                    String longCFName = shortCfNameMap.inverse().get(initialCFName);
-                    if (desc.getFamily(Bytes.toBytes(longCFName)) != null) {
-                        logger.warn("Configuration {}=true, but the table \"{}\" already has column family with long name \"{}\".",
-                            SHORT_CF_NAMES.getName(), tableName, longCFName);
-                        logger.warn("Check {} configuration.", SHORT_CF_NAMES.getName());
-                    }
-                } else if (!shortCfNames && initialCFName.equals(SYSTEM_PROPERTIES_STORE_NAME)) {
-                    String shortCFName = shortCfNameMap.get(initialCFName);
-                    if (desc.getFamily(Bytes.toBytes(shortCFName)) != null) {
-                        logger.warn("Configuration {}=false, but the table \"{}\" already has column family with short name \"{}\".",
-                            SHORT_CF_NAMES.getName(), tableName, shortCFName);
-                        logger.warn("Check {} configuration.", SHORT_CF_NAMES.getName());
-                    }
-                }
-            } else {
-                desc = createTable(tableName, initialCFName, ttlInSeconds, adm);
-            }
-        } catch (IOException e) {
-            throw new TemporaryBackendException(e);
-        } finally {
-            IOUtils.closeQuietly(adm);
-        }
-
-        return desc;
-    }
-
-    private HTableDescriptor createTable(String tableName, String cfName, int ttlInSeconds, AdminMask adm) throws IOException {
-        HTableDescriptor desc = compat.newTableDescriptor(tableName);
-
-        HColumnDescriptor columnDescriptor = new HColumnDescriptor(cfName);
-        setCFOptions(columnDescriptor, ttlInSeconds);
-
-        compat.addColumnFamilyToTableDescriptor(desc, columnDescriptor);
-
-        int count; // total regions to create
-        String src;
-
-        if (MIN_REGION_COUNT <= (count = regionCount)) {
-            src = "region count configuration";
-        } else if (0 < regionsPerServer &&
-            MIN_REGION_COUNT <= (count = regionsPerServer * adm.getEstimatedRegionServerCount())) {
-            src = "ClusterStatus server count";
-        } else {
-            count = -1;
-            src = "default";
-        }
-
-        if (MIN_REGION_COUNT < count) {
-            adm.createTable(desc, getStartKey(count), getEndKey(count), count);
-            logger.debug("Created table {} with region count {} from {}", tableName, count, src);
-        } else {
-            adm.createTable(desc);
-            logger.debug("Created table {} with default start key, end key, and region count", tableName);
-        }
-
-        return desc;
-    }
-
-    /**
-     * This method generates the second argument to
-     * {@link HBaseAdmin#createTable(HTableDescriptor, byte[], byte[], int)}.
-     * <p/>
-     * From the {@code createTable} javadoc:
-     * "The start key specified will become the end key of the first region of
-     * the table, and the end key specified will become the start key of the
-     * last region of the table (the first region has a null start key and
-     * the last region has a null end key)"
-     * <p/>
-     * To summarize, the {@code createTable} argument called "startKey" is
-     * actually the end key of the first region.
-     */
-    private byte[] getStartKey(int regionCount) {
-        ByteBuffer regionWidth = ByteBuffer.allocate(4);
-        regionWidth.putInt((int) (((1L << 32) - 1L) / regionCount)).flip();
-        return StaticArrayBuffer.of(regionWidth).getBytes(0, 4);
-    }
-
-    /**
-     * Companion to {@link #getStartKey(int)}. See its javadoc for details.
-     */
-    private byte[] getEndKey(int regionCount) {
-        ByteBuffer regionWidth = ByteBuffer.allocate(4);
-        regionWidth.putInt((int) (((1L << 32) - 1L) / regionCount * (regionCount - 1))).flip();
-        return StaticArrayBuffer.of(regionWidth).getBytes(0, 4);
-    }
-
-    private void ensureColumnFamilyExists(String tableName, String columnFamily, int ttlInSeconds) throws BackendException {
-        AdminMask adm = null;
-        try {
-            adm = getAdminInterface();
-            HTableDescriptor desc = ensureTableExists(tableName, columnFamily, ttlInSeconds);
-
-            Preconditions.checkNotNull(desc);
-
-            HColumnDescriptor cf = desc.getFamily(Bytes.toBytes(columnFamily));
-
-            // Create our column family, if necessary
-            if (cf == null) {
-                try {
-                    if (!adm.isTableDisabled(tableName)) {
-                        adm.disableTable(tableName);
-                    }
-                } catch (TableNotEnabledException e) {
-                    logger.debug("Table {} already disabled", tableName);
-                } catch (IOException e) {
-                    throw new TemporaryBackendException(e);
-                }
-
-                try {
-                    HColumnDescriptor columnDescriptor = new HColumnDescriptor(columnFamily);
-
-                    setCFOptions(columnDescriptor, ttlInSeconds);
-
-                    adm.addColumn(tableName, columnDescriptor);
-
-                    try {
-                        logger.debug("Added HBase ColumnFamily {}, waiting for 1 sec. to propogate.", columnFamily);
-                        Thread.sleep(1000L);
-                    } catch (InterruptedException ie) {
-                        throw new TemporaryBackendException(ie);
-                    }
-
-                    adm.enableTable(tableName);
-                } catch (TableNotFoundException ee) {
-                    logger.error("TableNotFoundException", ee);
-                    throw new PermanentBackendException(ee);
-                } catch (org.apache.hadoop.hbase.TableExistsException ee) {
-                    logger.debug("Swallowing exception {}", ee);
-                } catch (IOException ee) {
-                    throw new TemporaryBackendException(ee);
-                }
-            }
-        } finally {
-            IOUtils.closeQuietly(adm);
-        }
-    }
-
-    private void setCFOptions(HColumnDescriptor columnDescriptor, int ttlInSeconds) {
-        if (null != compression && !compression.equals(COMPRESSION_DEFAULT))
-            compat.setCompression(columnDescriptor, compression);
-
-        if (ttlInSeconds > 0)
-            columnDescriptor.setTimeToLive(ttlInSeconds);
-    }
-
-    /**
-     * Convert JanusGraph internal Mutation representation into HBase native commands.
-     *
-     * @param mutations    Mutations to convert into HBase commands.
-     * @param putTimestamp The timestamp to use for Put commands.
-     * @param delTimestamp The timestamp to use for Delete commands.
-     * @return Commands sorted by key converted from JanusGraph internal representation.
-     * @throws org.janusgraph.diskstorage.PermanentBackendException
-     */
-    @VisibleForTesting
-    Map<StaticBuffer, Pair<List<Put>, Delete>> convertToCommands(Map<String, Map<StaticBuffer, KCVMutation>> mutations,
-                                                                 final long putTimestamp,
-                                                                 final long delTimestamp) throws PermanentBackendException {
-// A map of rowkey to commands (list of Puts, Delete)
-        final Map<StaticBuffer, Pair<List<Put>, Delete>> commandsPerKey = new HashMap<>();
-
-        for (Map.Entry<String, Map<StaticBuffer, KCVMutation>> entry : mutations.entrySet()) {
-
-            String cfString = getCfNameForStoreName(entry.getKey());
-            byte[] cfName = Bytes.toBytes(cfString);
-
-            for (Map.Entry<StaticBuffer, KCVMutation> m : entry.getValue().entrySet()) {
-                final byte[] key = m.getKey().as(StaticBuffer.ARRAY_FACTORY);
-                KCVMutation mutation = m.getValue();
-
-                Pair<List<Put>, Delete> commands = commandsPerKey.get(m.getKey());
-
-                // The first time we go through the list of input <rowkey, KCVMutation>,
-                // create the holder for a particular rowkey
-                if (commands == null) {
-                    commands = new Pair<>();
-// List of all the Puts for this rowkey, including the ones without TTL and with TTL.
-                    final List<Put> putList = new ArrayList<>();
-                    commands.setFirst(putList);
-                    commandsPerKey.put(m.getKey(), commands);
-                }
-
-                if (mutation.hasDeletions()) {
-                    if (commands.getSecond() == null) {
-                        Delete d = new Delete(key);
-                        compat.setTimestamp(d, delTimestamp);
-                        commands.setSecond(d);
-                    }
-
-                    for (StaticBuffer b : mutation.getDeletions()) {
-                        // commands.getSecond() is a Delete for this rowkey.
-                        commands.getSecond().addColumns(cfName, b.as(StaticBuffer.ARRAY_FACTORY), delTimestamp);
-                    }
-                }
-
-                if (mutation.hasAdditions()) {
-// All the entries (column cells) with the rowkey use this one Put, except the ones with TTL.
-                    final Put putColumnsWithoutTtl = new Put(key, putTimestamp);
-                    // At the end of this loop, there will be one Put entry in the commands.getFirst() list that
-                    // contains all additions without TTL set, and possible multiple Put entries for columns
-                    // that have TTL set.
-                    for (Entry e : mutation.getAdditions()) {
-
-// Deal with TTL within the entry (column cell) first
-// HBase cell level TTL is actually set at the Mutation/Put level.
-// Therefore we need to construct a new Put for each entry (column cell) with TTL.
-// We can not combine them because column cells within the same rowkey may:
-// 1. have no TTL
-// 2. have TTL
-// 3. have different TTL
-                        final Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
-                        if (null != ttl && ttl > 0) {
-                            // Create a new Put
-                            Put putColumnWithTtl = new Put(key, putTimestamp);
-                            addColumnToPut(putColumnWithTtl, cfName, putTimestamp, e);
-                            // Convert ttl from second (JanusGraph TTL) to milliseconds (HBase TTL)
-                            // @see JanusGraphManagement#setTTL(JanusGraphSchemaType, Duration)
-                            // HBase supports cell-level TTL for versions 0.98.6 and above.
-                            (putColumnWithTtl).setTTL(ttl * 1000);
-                            // commands.getFirst() is the list of Puts for this rowkey. Add this
-                            // Put column with TTL to the list.
-                            commands.getFirst().add(putColumnWithTtl);
-                        } else {
-                            addColumnToPut(putColumnsWithoutTtl, cfName, putTimestamp, e);
-                        }
-                    }
-                    // If there were any mutations without TTL set, add them to commands.getFirst()
-                    if (!putColumnsWithoutTtl.isEmpty()) {
-                        commands.getFirst().add(putColumnsWithoutTtl);
-                    }
-                }
-            }
-        }
-
-        return commandsPerKey;
-    }
-
-    private void addColumnToPut(Put p, byte[] cfName, long putTimestamp, Entry e) {
-        p.addColumn(cfName, e.getColumnAs(StaticBuffer.ARRAY_FACTORY), putTimestamp,
-            e.getValueAs(StaticBuffer.ARRAY_FACTORY));
-    }
-
-    private String getCfNameForStoreName(String storeName) throws PermanentBackendException {
-        return shortCfNames ? shortenCfName(shortCfNameMap, storeName) : storeName;
-    }
-
-    private AdminMask getAdminInterface() {
-        try {
-            return cnx.getAdmin();
-        } catch (IOException e) {
-            throw new JanusGraphException(e);
-        }
     }
 
     private String determineTableName(org.janusgraph.diskstorage.configuration.Configuration config) {
@@ -991,8 +383,4 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         return config.get(COUCHBASE_BUCKET);
     }
 
-    @VisibleForTesting
-    protected org.apache.hadoop.conf.Configuration getHBaseConf() {
-        return hconf;
-    }
 }

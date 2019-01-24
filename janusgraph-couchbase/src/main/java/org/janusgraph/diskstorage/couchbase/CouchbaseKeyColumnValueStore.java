@@ -14,7 +14,10 @@
 
 package org.janusgraph.diskstorage.couchbase;
 
+import com.couchbase.client.java.Bucket;
+import com.couchbase.client.java.query.N1qlQuery;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
@@ -23,7 +26,13 @@ import org.apache.hadoop.hbase.filter.ColumnRangeFilter;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterList;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.janusgraph.diskstorage.BackendException;
+import org.janusgraph.diskstorage.EntryList;
+import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyColumnValueStore;
+import org.janusgraph.diskstorage.keycolumnvalue.KeySliceQuery;
+import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
+import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
 import org.janusgraph.diskstorage.util.RecordIterator;
 import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.janusgraph.diskstorage.util.StaticArrayEntry;
@@ -31,6 +40,7 @@ import org.janusgraph.diskstorage.util.StaticArrayEntryList;
 import org.janusgraph.util.system.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import rx.Observable;
 
 import javax.annotation.Nullable;
 import java.io.Closeable;
@@ -39,24 +49,14 @@ import java.io.InterruptedIOException;
 import java.util.*;
 
 /**
- * Here are some areas that might need work:
- * <p>
- * - batching? (consider HTable#batch, HTable#setAutoFlush(false)
- * - tuning HTable#setWriteBufferSize (?)
- * - writing a server-side filter to replace ColumnCountGetFilter, which drops
- * all columns on the row where it reaches its limit.  This requires getSlice,
- * currently, to impose its limit on the client side.  That obviously won't
- * scale.
- * - RowMutations for combining Puts+Deletes (need a newer HBase than 0.92 for this)
- * - (maybe) fiddle with HTable#setRegionCachePrefetch and/or #prewarmRegionCache
- * <p>
- * There may be other problem areas.  These are just the ones of which I'm aware.
+ *
  */
 public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
     private static final Logger logger = LoggerFactory.getLogger(CouchbaseKeyColumnValueStore.class);
 
     private final String bucketName;
+    private final Bucket bucket;
     private final CouchbaseStoreManager storeManager;
 
     // When using shortened CF names, columnFamily is the shortname and storeName is the longname
@@ -69,10 +69,10 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
     private final ConnectionMask cnx;
 
-    CouchbaseKeyColumnValueStore(CouchbaseStoreManager storeManager, ConnectionMask cnx, String bucketName, String table) {
+    CouchbaseKeyColumnValueStore(CouchbaseStoreManager storeManager, String bucketName, String table, Bucket bucket) {
         this.storeManager = storeManager;
-        this.cnx = cnx;
         this.bucketName = bucketName;
+        this.bucket = bucket;
         //this.columnFamily = columnFamily;
         this.storeName = storeName;
         this.columnFamilyBytes = Bytes.toBytes(columnFamily);
@@ -85,13 +85,30 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
     @Override
     public EntryList getSlice(KeySliceQuery query, StoreTransaction txh) throws BackendException {
-        Map<StaticBuffer, EntryList> result = getHelper(Collections.singletonList(query.getKey()), getFilter(query));
-        return Iterables.getOnlyElement(result.values(), EntryList.EMPTY_LIST);
+        Map<StaticBuffer, EntryList> result = getNamesSlice(query.getKey(), query, txh);
+        return Iterables.getOnlyElement(result.values(),EntryList.EMPTY_LIST);
     }
 
     @Override
-    public Map<StaticBuffer,EntryList> getSlice(List<StaticBuffer> keys, SliceQuery query, StoreTransaction txh) throws BackendException {
-        return getHelper(keys, getFilter(query));
+    public Map<StaticBuffer, EntryList> getSlice(List<StaticBuffer> keys, SliceQuery query, StoreTransaction txh)
+        throws BackendException {
+        return getNamesSlice(keys, query, txh);
+    }
+
+    public Map<StaticBuffer, EntryList> getNamesSlice(StaticBuffer key, SliceQuery query, StoreTransaction txh)
+        throws BackendException {
+        return getNamesSlice(ImmutableList.of(key), query, txh);
+    }
+
+
+    public Map<StaticBuffer, EntryList> getNamesSlice(List<StaticBuffer> keys, SliceQuery query, StoreTransaction txh)
+        throws BackendException {
+        bucket.lookupIn("")
+        //Observable.amb()
+
+
+
+
     }
 
     @Override
