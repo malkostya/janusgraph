@@ -15,24 +15,15 @@
 package org.janusgraph.diskstorage.couchbase;
 
 import com.couchbase.client.java.Bucket;
+import com.couchbase.client.java.document.json.JsonArray;
+import com.couchbase.client.java.document.json.JsonObject;
 import com.couchbase.client.java.query.N1qlQuery;
+import com.couchbase.client.java.query.N1qlQueryRow;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
-import org.apache.hadoop.hbase.filter.ColumnPaginationFilter;
-import org.apache.hadoop.hbase.filter.ColumnRangeFilter;
-import org.apache.hadoop.hbase.filter.Filter;
-import org.apache.hadoop.hbase.filter.FilterList;
-import org.apache.hadoop.hbase.util.Bytes;
-import org.janusgraph.diskstorage.BackendException;
-import org.janusgraph.diskstorage.EntryList;
-import org.janusgraph.diskstorage.StaticBuffer;
-import org.janusgraph.diskstorage.keycolumnvalue.KeyColumnValueStore;
-import org.janusgraph.diskstorage.keycolumnvalue.KeySliceQuery;
-import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
-import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
+import org.janusgraph.diskstorage.*;
+import org.janusgraph.diskstorage.keycolumnvalue.*;
 import org.janusgraph.diskstorage.util.RecordIterator;
 import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.janusgraph.diskstorage.util.StaticArrayEntry;
@@ -40,13 +31,11 @@ import org.janusgraph.diskstorage.util.StaticArrayEntryList;
 import org.janusgraph.util.system.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import rx.Observable;
 
-import javax.annotation.Nullable;
 import java.io.Closeable;
-import java.io.IOException;
-import java.io.InterruptedIOException;
+import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  *
@@ -58,25 +47,15 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     private final String bucketName;
     private final Bucket bucket;
     private final CouchbaseStoreManager storeManager;
-
-    // When using shortened CF names, columnFamily is the shortname and storeName is the longname
-    // When not using shortened CF names, they are the same
-    //private final String columnFamily;
-    private final String storeName;
-    // This is columnFamily.getBytes()
-    private final byte[] columnFamilyBytes;
-    private final HBaseGetter entryGetter;
-
-    private final ConnectionMask cnx;
+    private final CouchbaseGetter entryGetter;
+    private final String table;
 
     CouchbaseKeyColumnValueStore(CouchbaseStoreManager storeManager, String bucketName, String table, Bucket bucket) {
         this.storeManager = storeManager;
         this.bucketName = bucketName;
         this.bucket = bucket;
-        //this.columnFamily = columnFamily;
-        this.storeName = storeName;
-        this.columnFamilyBytes = Bytes.toBytes(columnFamily);
-        this.entryGetter = new HBaseGetter(storeManager.getMetaDataSchema(storeName));
+        this.table = table;
+        this.entryGetter = new CouchbaseGetter(storeManager.getMetaDataSchema(this.table));
     }
 
     @Override
@@ -85,36 +64,36 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
     @Override
     public EntryList getSlice(KeySliceQuery query, StoreTransaction txh) throws BackendException {
-        Map<StaticBuffer, EntryList> result = getNamesSlice(query.getKey(), query, txh);
-        return Iterables.getOnlyElement(result.values(),EntryList.EMPTY_LIST);
+        final List<N1qlQueryRow> rows = query(Collections.singletonList(query.getKey()), null, null,
+            query.getSliceStart(), query.getSliceEnd(), query.hasLimit() ? query.getLimit() : 0);
+
+        if (rows.isEmpty())
+            return EntryList.EMPTY_LIST;
+        else if (rows.size() == 1) {
+            final JsonArray columns = rows.get(0).value().getArray(CouchbaseColumn.COLUMNS);
+            return StaticArrayEntryList.ofByteBuffer(columns.iterator(), entryGetter);
+        } else
+            throw new TemporaryBackendException("Multiple rows with the same key.");
     }
 
     @Override
     public Map<StaticBuffer, EntryList> getSlice(List<StaticBuffer> keys, SliceQuery query, StoreTransaction txh)
         throws BackendException {
-        return getNamesSlice(keys, query, txh);
-    }
+        final List<N1qlQueryRow> rows = query(keys, null, null,
+            query.getSliceStart(), query.getSliceEnd(), getLimit(query));
 
-    public Map<StaticBuffer, EntryList> getNamesSlice(StaticBuffer key, SliceQuery query, StoreTransaction txh)
-        throws BackendException {
-        return getNamesSlice(ImmutableList.of(key), query, txh);
-    }
-
-
-    public Map<StaticBuffer, EntryList> getNamesSlice(List<StaticBuffer> keys, SliceQuery query, StoreTransaction txh)
-        throws BackendException {
-        bucket.lookupIn("")
-        //Observable.amb()
-
-
-
-
+        return rows.stream().collect(Collectors.toMap(
+            row -> CouchbaseColumnConverter.INSTANCE.toStaticBuffer(row.value().getString(CouchbaseColumn.ID)),
+            row -> StaticArrayEntryList.ofByteBuffer(row.value().getArray(CouchbaseColumn.COLUMNS).iterator(),
+                entryGetter)
+        ));
     }
 
     @Override
-    public void mutate(StaticBuffer key, List<Entry> additions, List<StaticBuffer> deletions, StoreTransaction txh) throws BackendException {
+    public void mutate(StaticBuffer key, List<Entry> additions, List<StaticBuffer> deletions, StoreTransaction txh)
+        throws BackendException {
         Map<StaticBuffer, KCVMutation> mutations = ImmutableMap.of(key, new KCVMutation(additions, deletions));
-        mutateMany(mutations, txh);
+        storeManager.mutateMany(ImmutableMap.of(table, mutations), txh);
     }
 
     @Override
@@ -126,136 +105,141 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     }
 
     @Override
-    public KeyIterator getKeys(KeyRangeQuery query, StoreTransaction txh) throws BackendException {
-        return executeKeySliceQuery(query.getKeyStart().as(StaticBuffer.ARRAY_FACTORY),
-                query.getKeyEnd().as(StaticBuffer.ARRAY_FACTORY),
-                new FilterList(FilterList.Operator.MUST_PASS_ALL),
-                query);
+    public String getName() {
+        return table;
     }
 
     @Override
-    public String getName() {
-        return storeName;
+    public KeyIterator getKeys(KeyRangeQuery query, StoreTransaction txh) throws BackendException {
+        return executeKeySliceQuery(query.getKeyStart(), query.getKeyEnd(), query.getSliceStart(), query.getSliceEnd(),
+            getLimit(query));
     }
 
     @Override
     public KeyIterator getKeys(SliceQuery query, StoreTransaction txh) throws BackendException {
-        return executeKeySliceQuery(new FilterList(FilterList.Operator.MUST_PASS_ALL), query);
+        return executeKeySliceQuery(null, null, query.getSliceStart(), query.getSliceEnd(),
+            getLimit(query));
     }
 
-    public static Filter getFilter(SliceQuery query) {
-        byte[] colStartBytes = query.getSliceStart().length() > 0 ? query.getSliceStart().as(StaticBuffer.ARRAY_FACTORY) : null;
-        byte[] colEndBytes = query.getSliceEnd().length() > 0 ? query.getSliceEnd().as(StaticBuffer.ARRAY_FACTORY) : null;
+    private KeyIterator executeKeySliceQuery(StaticBuffer keyStart, StaticBuffer keyEnd,
+                                             StaticBuffer sliceStart, StaticBuffer sliceEnd, int limit) {
 
-        Filter filter = new ColumnRangeFilter(colStartBytes, true, colEndBytes, false);
+        final List<N1qlQueryRow> rows = query(null, keyStart, keyEnd, sliceStart, sliceEnd, limit);
 
-        if (query.hasLimit()) {
-            filter = new FilterList(FilterList.Operator.MUST_PASS_ALL,
-                    filter,
-                    new ColumnPaginationFilter(query.getLimit(), colStartBytes));
-        }
+        // TODO
 
-        logger.debug("Generated HBase Filter {}", filter);
-
-        return filter;
+        return null;
     }
 
-    private Map<StaticBuffer,EntryList> getHelper(List<StaticBuffer> keys, Filter getFilter) throws BackendException {
-        List<Get> requests = new ArrayList<>(keys.size());
-        {
-            for (StaticBuffer key : keys) {
-                Get g = new Get(key.as(StaticBuffer.ARRAY_FACTORY)).addFamily(columnFamilyBytes).setFilter(getFilter);
-                try {
-                    g.setTimeRange(0, Long.MAX_VALUE);
-                } catch (IOException e) {
-                    throw new PermanentBackendException(e);
-                }
-                requests.add(g);
+    private List<N1qlQueryRow> query(List<StaticBuffer> keys, StaticBuffer keyStart, StaticBuffer keyEnd,
+                                     StaticBuffer sliceStart, StaticBuffer sliceEnd, int limit) {
+        final long currentTimeMillis = storeManager.currentTimeMillis();
+        final StringBuilder select = new StringBuilder("SELECT");
+        final StringBuilder where = new StringBuilder(" WHERE table = $table");
+        final JsonObject placeholderValues = JsonObject.create()
+            .put("table", table)
+            .put("curtime", currentTimeMillis);
+
+        if (keys != null) {
+            if (keys.size() == 1) {
+                where.append(" AND meta().id = $key");
+                placeholderValues.put("key", CouchbaseColumnConverter.INSTANCE.toString(keys.get(0)));
+            } else {
+                select.append(" meta().id AS id,");
+                where.append(" AND meta().id IN [");
+                for (StaticBuffer key : keys)
+                    where.append(CouchbaseColumnConverter.INSTANCE.toString(key)).append(", ");
+                where.delete(where.length() - 2, where.length()).append("]");
+            }
+        } else {
+            select.append(" meta().id AS id,");
+
+            if (keyStart != null) {
+                where.append(" AND meta().id >= $keyStart");
+                placeholderValues.put("keyStart", CouchbaseColumnConverter.INSTANCE.toString(keyStart));
+            }
+
+            if (keyEnd != null) {
+                where.append(" AND meta().id < $keyEnd");
+                placeholderValues.put("keyEnd", CouchbaseColumnConverter.INSTANCE.toString(keyEnd));
             }
         }
 
-        final Map<StaticBuffer,EntryList> resultMap = new HashMap<>(keys.size());
+        select.append(" ARRAY a FOR a IN columns WHEN a.writetime + a.ttl > $curtime"); // TODO change to '> ").append(currentTimeMillis)' if it's not working
+        where.append(" AND ANY a IN columns SATISFIES a.writetime + a.ttl > $curtime");
 
-        try {
-            TableMask table = null;
-            final Result[] results;
 
-            try {
-                table = cnx.getTable(bucketName);
-                results = table.get(requests);
-            } finally {
-                IOUtils.closeQuietly(table);
+        if (sliceStart != null) {
+            final String sliceStartString = CouchbaseColumnConverter.INSTANCE.toString(sliceStart);
+            select.append(" AND a.key >= $sliceStart"); // TODO change to '>= ").append(sliceStartString)' if it's not working
+            where.append(" AND a.key >= $sliceStart");
+            placeholderValues.put("$sliceStart", sliceStartString);
+        }
+
+        if (sliceEnd != null) {
+            final String sliceEndString = CouchbaseColumnConverter.INSTANCE.toString(sliceEnd);
+            select.append(" AND a.key < $sliceEnd"); // TODO change to '< ").append(sliceEndString)' if it's not working
+            where.append(" AND a.key < $sliceEnd");
+            placeholderValues.put("$sliceEnd", sliceEndString);
+        }
+
+        select.append(" END as columns");
+        where.append(" END");
+
+        if (limit > 0) {
+            where.append(" LIMIT $limit");
+            placeholderValues.put("limit", limit);
+        }
+
+        final N1qlQuery n1qlQuery = N1qlQuery.parameterized(
+            select.append(" FROM `").append(bucketName).append("`").append(where).toString(),
+            placeholderValues);
+
+        return bucket.query(n1qlQuery).allRows();
+    }
+
+    private int getLimit(SliceQuery query) {
+        return query.hasLimit() ? query.getLimit() : 0;
+    }
+
+    private static class CouchbaseGetter implements StaticArrayEntry.GetColVal<Object, ByteBuffer> {
+
+        private final EntryMetaData[] schema;
+
+        private CouchbaseGetter(EntryMetaData[] schema) {
+            this.schema = schema;
+        }
+
+        @Override
+        public ByteBuffer getColumn(Object element) {
+            return asByteBuffer(element, CouchbaseColumn.KEY);
+        }
+
+        @Override
+        public ByteBuffer getValue(Object element) {
+            return asByteBuffer(element, CouchbaseColumn.VALUE);
+        }
+
+        @Override
+        public EntryMetaData[] getMetaSchema(Object element) {
+            return schema;
+        }
+
+        @Override
+        public Object getMetaData(Object element, EntryMetaData meta) {
+            switch (meta) {
+                case TIMESTAMP:
+                    return ((JsonObject) element).getLong(CouchbaseColumn.WRITE_TIME);
+                case TTL:
+                    return ((JsonObject) element).getInt(CouchbaseColumn.TTL);
+                default:
+                    throw new UnsupportedOperationException("Unsupported meta data: " + meta);
             }
-
-            if (results == null)
-                return KCVSUtil.emptyResults(keys);
-
-            assert results.length==keys.size();
-
-            for (int i = 0; i < results.length; i++) {
-                final Result result = results[i];
-                NavigableMap<byte[], NavigableMap<byte[], NavigableMap<Long, byte[]>>> f = result.getMap();
-
-                if (f == null) { // no result for this key
-                    resultMap.put(keys.get(i), EntryList.EMPTY_LIST);
-                    continue;
-                }
-
-                // actual key with <timestamp, value>
-                NavigableMap<byte[], NavigableMap<Long, byte[]>> r = f.get(columnFamilyBytes);
-                resultMap.put(keys.get(i), (r == null)
-                                            ? EntryList.EMPTY_LIST
-                                            : StaticArrayEntryList.ofBytes(r.entrySet(), entryGetter));
-            }
-
-            return resultMap;
-        } catch (InterruptedIOException e) {
-            // added to support traversal interruption
-            Thread.currentThread().interrupt();
-            throw new PermanentBackendException(e);
-        } catch (IOException e) {
-            throw new TemporaryBackendException(e);
-        }
-    }
-
-    private void mutateMany(Map<StaticBuffer, KCVMutation> mutations, StoreTransaction txh) throws BackendException {
-        storeManager.mutateMany(ImmutableMap.of(storeName, mutations), txh);
-    }
-
-    private KeyIterator executeKeySliceQuery(FilterList filters, @Nullable SliceQuery columnSlice) throws BackendException {
-        return executeKeySliceQuery(null, null, filters, columnSlice);
-    }
-
-    private KeyIterator executeKeySliceQuery(@Nullable byte[] startKey,
-                                            @Nullable byte[] endKey,
-                                            FilterList filters,
-                                            @Nullable SliceQuery columnSlice) throws BackendException {
-        Scan scan = new Scan().addFamily(columnFamilyBytes);
-
-        try {
-            scan.setTimeRange(0, Long.MAX_VALUE);
-        } catch (IOException e) {
-            throw new PermanentBackendException(e);
         }
 
-        if (startKey != null)
-            scan.setStartRow(startKey);
-
-        if (endKey != null)
-            scan.setStopRow(endKey);
-
-        if (columnSlice != null) {
-            filters.addFilter(getFilter(columnSlice));
-        }
-
-        TableMask table = null;
-
-        try {
-            table = cnx.getTable(bucketName);
-            return new RowIterator(table, table.getScanner(scan.setFilter(filters)), columnFamilyBytes);
-        } catch (IOException e) {
-            IOUtils.closeQuietly(table);
-            throw new PermanentBackendException(e);
+        private ByteBuffer asByteBuffer(Object element, String elementKey) {
+            final String elementValue = ((JsonObject) element).getString(elementKey);
+            return CouchbaseColumnConverter.INSTANCE.toByteBuffer(elementValue);
         }
     }
 
@@ -279,6 +263,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
             return new RecordIterator<Entry>() {
                 private final Iterator<Map.Entry<byte[], NavigableMap<Long, byte[]>>> kv;
+
                 {
                     final Map<byte[], NavigableMap<byte[], NavigableMap<Long, byte[]>>> map = currentRow.getMap();
                     Preconditions.checkNotNull(map);
@@ -338,40 +323,6 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         private void ensureOpen() {
             if (isClosed)
                 throw new IllegalStateException("Iterator has been closed.");
-        }
-    }
-
-    private static class HBaseGetter implements StaticArrayEntry.GetColVal<Map.Entry<byte[], NavigableMap<Long, byte[]>>, byte[]> {
-
-        private final EntryMetaData[] schema;
-
-        private HBaseGetter(EntryMetaData[] schema) {
-            this.schema = schema;
-        }
-
-        @Override
-        public byte[] getColumn(Map.Entry<byte[], NavigableMap<Long, byte[]>> element) {
-            return element.getKey();
-        }
-
-        @Override
-        public byte[] getValue(Map.Entry<byte[], NavigableMap<Long, byte[]>> element) {
-            return element.getValue().lastEntry().getValue();
-        }
-
-        @Override
-        public EntryMetaData[] getMetaSchema(Map.Entry<byte[], NavigableMap<Long, byte[]>> element) {
-            return schema;
-        }
-
-        @Override
-        public Object getMetaData(Map.Entry<byte[], NavigableMap<Long, byte[]>> element, EntryMetaData meta) {
-            switch(meta) {
-                case TIMESTAMP:
-                    return element.getValue().lastEntry().getKey();
-                default:
-                    throw new UnsupportedOperationException("Unsupported meta data: " + meta);
-            }
         }
     }
 }

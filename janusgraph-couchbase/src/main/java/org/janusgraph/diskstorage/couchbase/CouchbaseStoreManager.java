@@ -230,20 +230,20 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     public void mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> batch, StoreTransaction txh) throws BackendException {
         final MaskedTimestamp commitTime = new MaskedTimestamp(txh);
         final List<CouchbaseDocumentMutation> documentMutations = convertToDocumentMutations(batch);
-        final long currentTimeMillis = System.currentTimeMillis();
 
         Observable
             .from(documentMutations)
             .flatMap(docMutation -> {
+                final long currentTimeMillis = currentTimeMillis();
                 // we should get whole document to clean up expired columns otherwise we could mutate document's fragments
-                JsonDocument document = bucket.get(docMutation.getDocumentId());
+                JsonDocument document = bucket.get(docMutation.getDocumentId()); // TODO add getAndLock option to enforce consistency
 
                 if (document == null)
                     document = JsonDocument.create(
                         docMutation.getDocumentId(),
                         JsonObject.create()
-                            .put("table", docMutation.getTable())
-                            .put("columns", JsonArray.create())
+                            .put(CouchbaseColumn.TABLE, docMutation.getTable())
+                            .put(CouchbaseColumn.COLUMNS, JsonArray.create())
                     );
 
                 Map<String, CouchbaseColumn> columns = getColumnsFromDocument(document, currentTimeMillis);
@@ -252,10 +252,10 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                 if (mutation.hasAdditions()) {
                     for (Entry e : mutation.getAdditions()) {
                         Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
-                        long expire = null != ttl && ttl > 0 ? currentTimeMillis + ttl : 0;
 
                         columns.put(e.getColumnAs(CouchbaseColumnConverter.INSTANCE), new CouchbaseColumn(
-                            e.getValueAs(CouchbaseColumnConverter.INSTANCE), expire));
+                            e.getValueAs(CouchbaseColumnConverter.INSTANCE), currentTimeMillis,
+                            null != ttl && ttl > 0 ? ttl : 0));
                     }
                 }
 
@@ -280,24 +280,26 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     private void updateColumns(JsonDocument document, Map<String, CouchbaseColumn> columns) {
         final List<JsonObject> columnsList = columns.entrySet().stream().map(entry ->
             JsonObject.create()
-                .put("key", entry.getKey())
-                .put("value", entry.getValue().getValue())
-                .put("expire", entry.getValue().getExpire())
+                .put(CouchbaseColumn.KEY, entry.getKey())
+                .put(CouchbaseColumn.VALUE, entry.getValue().getValue())
+                .put(CouchbaseColumn.WRITE_TIME, entry.getValue().getWritetime())
+                .put(CouchbaseColumn.TTL, entry.getValue().getTtl())
         ).collect(Collectors.toList());
 
-        document.content().put("columns", JsonArray.from(columnsList));
+        document.content().put(CouchbaseColumn.COLUMNS, JsonArray.from(columnsList));
     }
 
     private Map<String, CouchbaseColumn> getColumnsFromDocument(JsonDocument document, long currentTimeMillis) {
         final Map<String, CouchbaseColumn> columns = new HashMap<>();
-        final Iterator it = document.content().getArray("columns").iterator();
+        final Iterator it = document.content().getArray(CouchbaseColumn.COLUMNS).iterator();
 
         while (it.hasNext()) {
             JsonObject column = (JsonObject) it.next();
-            long expire = column.getLong("expire");
-            if (expire == 0 || expire > currentTimeMillis)
-                columns.put(column.getString("key"), new CouchbaseColumn(column.getString("value"),
-                    expire));
+            long writetime = column.getLong(CouchbaseColumn.WRITE_TIME);
+            int ttl = column.getInt(CouchbaseColumn.TTL);
+            if (ttl == 0 || writetime + ttl > currentTimeMillis)
+                columns.put(column.getString(CouchbaseColumn.KEY),
+                    new CouchbaseColumn(column.getString(CouchbaseColumn.VALUE), writetime, ttl));
         }
 
         return columns;
@@ -313,7 +315,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             Map<StaticBuffer, KCVMutation> mutations = batchEntry.getValue();
             for (Map.Entry<StaticBuffer, KCVMutation> ent : mutations.entrySet()) {
                 KCVMutation mutation = ent.getValue();
-                String id = convertToString(ent.getKey());
+                String id = CouchbaseColumnConverter.INSTANCE.toString(ent.getKey());
                 documentMutations.add(new CouchbaseDocumentMutation(table, id, mutation));
             }
         }
@@ -321,9 +323,8 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         return documentMutations;
     }
 
-    private String convertToString(StaticBuffer buffer) {
-        final byte[] array = buffer.getBytes(0, buffer.length());
-        return CouchbaseColumnConverter.INSTANCE.toString(array);
+    public long currentTimeMillis() {
+        return System.currentTimeMillis();
     }
 
     @Override
@@ -332,7 +333,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
         if (store == null) {
             CouchbaseKeyColumnValueStore newStore = new CouchbaseKeyColumnValueStore(this, bucketName,
-                name);
+                name, bucket);
 
             store = openStores.putIfAbsent(name, newStore);
 
