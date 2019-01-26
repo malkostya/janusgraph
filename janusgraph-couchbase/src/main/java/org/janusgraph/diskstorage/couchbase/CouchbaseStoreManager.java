@@ -1,25 +1,14 @@
-// Copyright 2017 JanusGraph Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package org.janusgraph.diskstorage.couchbase;
 
+import com.couchbase.client.core.CouchbaseException;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.CouchbaseCluster;
 import com.couchbase.client.java.document.JsonDocument;
 import com.couchbase.client.java.document.json.JsonArray;
 import com.couchbase.client.java.document.json.JsonObject;
+import com.couchbase.client.java.query.N1qlQuery;
+import com.couchbase.client.java.query.N1qlQueryResult;
 import com.google.common.base.Preconditions;
 import org.janusgraph.diskstorage.*;
 import org.janusgraph.diskstorage.common.DistributedStoreManager;
@@ -34,6 +23,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import rx.Observable;
 
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -61,7 +51,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                 " to that value.",
             ConfigOption.Type.LOCAL, "janusgraph");
 
-    public static final int PORT_DEFAULT = 2181;  // Not used. Just for the parent constructor.
+    public static final int PORT_DEFAULT = 8091;  // Not used. Just for the parent constructor.
 
     public static final TimestampProviders PREFERRED_TIMESTAMPS = TimestampProviders.MILLI;
 
@@ -69,6 +59,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     private final String bucketName;
     private final Cluster cluster;
     private final Bucket bucket;
+    private final BucketHelper bucketHelper;
 
     // Mutable instance state
     private final ConcurrentMap<String, CouchbaseKeyColumnValueStore> openStores;
@@ -82,7 +73,10 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
         this.bucketName = determineTableName(config);
 
+        bucketHelper = new BucketHelper(hostnames[0], port, "janusgraph", "janusgraph"); // TODO fix
+        ensureBucketExists();
         cluster = CouchbaseCluster.create(hostnames);
+        cluster.authenticate("janusgraph", "janusgraph"); // TODO change to authenticate(username, password);
         bucket = cluster.openBucket(bucketName);
 
 //
@@ -204,6 +198,12 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         } catch (Exception e) {
             logger.warn("Failed disconnecting cluster", e);
         }
+
+        try {
+            bucketHelper.close();
+        } catch (IOException e) {
+            logger.warn("Failed closing bucketHelper", e);
+        }
     }
 
     @Override
@@ -231,50 +231,81 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         final MaskedTimestamp commitTime = new MaskedTimestamp(txh);
         final List<CouchbaseDocumentMutation> documentMutations = convertToDocumentMutations(batch);
 
-        Observable
-            .from(documentMutations)
-            .flatMap(docMutation -> {
-                final long currentTimeMillis = currentTimeMillis();
-                // we should get whole document to clean up expired columns otherwise we could mutate document's fragments
-                JsonDocument document = bucket.get(docMutation.getDocumentId()); // TODO add getAndLock option to enforce consistency
+        try {
+            Observable
+                .from(documentMutations)
+                .flatMap(docMutation -> {
+                    final JsonDocument document = getMutatedDocument(docMutation);
+                    final Map<String, CouchbaseColumn> columns = getMutatedColumns(docMutation, document);
 
-                if (document == null)
-                    document = JsonDocument.create(
-                        docMutation.getDocumentId(),
-                        JsonObject.create()
-                            .put(CouchbaseColumn.TABLE, docMutation.getTable())
-                            .put(CouchbaseColumn.COLUMNS, JsonArray.create())
-                    );
-
-                Map<String, CouchbaseColumn> columns = getColumnsFromDocument(document, currentTimeMillis);
-                KCVMutation mutation = docMutation.getMutation();
-
-                if (mutation.hasAdditions()) {
-                    for (Entry e : mutation.getAdditions()) {
-                        Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
-
-                        columns.put(e.getColumnAs(CouchbaseColumnConverter.INSTANCE), new CouchbaseColumn(
-                            e.getValueAs(CouchbaseColumnConverter.INSTANCE), currentTimeMillis,
-                            null != ttl && ttl > 0 ? ttl : 0));
-                    }
-                }
-
-                if (mutation.hasDeletions()) {
-                    for (StaticBuffer b : mutation.getDeletions())
-                        columns.remove(b.as(CouchbaseColumnConverter.INSTANCE));
-                }
-
-                if (!columns.isEmpty()) {
-                    updateColumns(document, columns);
-                    return bucket.async().upsert(document); // TODO add PersistTo and ReplicateTo
-                } else
-                    return bucket.async().remove(document); // TODO add PersistTo and ReplicateTo
-            })
-            .last()
-            .toBlocking()
-            .single();
+                    if (!columns.isEmpty()) {
+                        updateColumns(document, columns);
+                        return bucket.async().upsert(document); // TODO add PersistTo and ReplicateTo
+                    } else
+                        return bucket.async().remove(document); // TODO add PersistTo and ReplicateTo
+                })
+                .last()
+                .toBlocking()
+                .single();
+        } catch (CouchbaseException e) {
+            throw new TemporaryBackendException(e);
+        }
 
         sleepAfterWrite(txh, commitTime);
+    }
+
+    public void mutate(CouchbaseDocumentMutation docMutation, StoreTransaction txh) throws BackendException {
+        final MaskedTimestamp commitTime = new MaskedTimestamp(txh);
+        final JsonDocument document = getMutatedDocument(docMutation);
+        final Map<String, CouchbaseColumn> columns = getMutatedColumns(docMutation, document);
+
+        if (!columns.isEmpty()) {
+            updateColumns(document, columns);
+            bucket.upsert(document); // TODO add PersistTo and ReplicateTo
+        } else
+            bucket.remove(document); // TODO add PersistTo and ReplicateTo
+
+        sleepAfterWrite(txh, commitTime);
+    }
+
+    private JsonDocument getMutatedDocument(CouchbaseDocumentMutation docMutation) {
+        // we should get whole document to clean up expired columns otherwise we could mutate document's fragments
+        JsonDocument document = bucket.get(docMutation.getDocumentId()); // TODO add getAndLock option to enforce consistency
+
+        if (document == null)
+            document = JsonDocument.create(
+                docMutation.getDocumentId(),
+                JsonObject.create()
+                    .put(CouchbaseColumn.TABLE, docMutation.getTable())
+                    .put(CouchbaseColumn.COLUMNS, JsonArray.create())
+            );
+
+        return document;
+    }
+
+    private Map<String, CouchbaseColumn> getMutatedColumns(CouchbaseDocumentMutation docMutation,
+                                                           JsonDocument document) {
+        final long currentTimeMillis = currentTimeMillis();
+
+        Map<String, CouchbaseColumn> columns = getColumnsFromDocument(document, currentTimeMillis);
+        KCVMutation mutation = docMutation.getMutation();
+
+        if (mutation.hasAdditions()) {
+            for (Entry e : mutation.getAdditions()) {
+                Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
+
+                columns.put(e.getColumnAs(CouchbaseColumnConverter.INSTANCE), new CouchbaseColumn(
+                    e.getValueAs(CouchbaseColumnConverter.INSTANCE), currentTimeMillis,
+                    null != ttl && ttl > 0 ? ttl : 0));
+            }
+        }
+
+        if (mutation.hasDeletions()) {
+            for (StaticBuffer b : mutation.getDeletions())
+                columns.remove(b.as(CouchbaseColumnConverter.INSTANCE));
+        }
+
+        return columns;
     }
 
     private void updateColumns(JsonDocument document, Map<String, CouchbaseColumn> columns) {
@@ -338,6 +369,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             store = openStores.putIfAbsent(name, newStore);
 
             if (store == null) {
+                ensureBucketExists();
                 store = newStore;
             }
         }
@@ -346,7 +378,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     }
 
     @Override
-    public StoreTransaction beginTransaction(final BaseTransactionConfig config) throws BackendException {
+    public StoreTransaction beginTransaction(final BaseTransactionConfig config) {
         return new CouchbaseTransaction(config);
     }
 
@@ -360,21 +392,45 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      */
     @Override
     public void clearStorage() throws BackendException {
-        try {
-            bucket.query(deleteFrom(bucketName));
-        } catch (Exception e) {
-            throw new TemporaryBackendException(e);
+        logger.info("clearStorage");
+        if (this.storageConfig.get(GraphDatabaseConfiguration.DROP_ON_CLEAR)) {
+            bucketHelper.drop(bucketName);
+        } else {
+            if (exists())
+                bucketHelper.drop(bucketName);
+            createBucket();
+            // TODO not working
+//            try {
+//                N1qlQueryResult queryResult = bucket.query(deleteFrom(bucketName));
+//                System.out.println(queryResult.status());
+//            } catch (CouchbaseException e) {
+//                throw new TemporaryBackendException(e);
+//            }
         }
     }
 
     @Override
     public boolean exists() throws BackendException {
-        return true;
+        return bucketHelper.exists(bucketName);
     }
 
     @Override
-    public List<KeyRange> getLocalKeyPartition() throws BackendException {
+    public List<KeyRange> getLocalKeyPartition() {
         throw new UnsupportedOperationException();
+    }
+
+    private void ensureBucketExists() throws BackendException {
+        logger.info("ensureBucketExists");
+        if (!exists()) {
+            createBucket();
+        }
+    }
+
+    private void createBucket() throws BackendException {
+        // TODO put params to config
+        bucketHelper.create(bucketName, "couchbase", 2000);
+        bucket.query(N1qlQuery.simple("CREATE PRIMARY INDEX `" + bucketName + "_primary` ON `" +
+            bucketName + "` WITH { \"defer_build\":false }"));
     }
 
     private String determineTableName(org.janusgraph.diskstorage.configuration.Configuration config) {

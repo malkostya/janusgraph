@@ -1,49 +1,30 @@
-// Copyright 2017 JanusGraph Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package org.janusgraph.diskstorage.couchbase;
 
+import com.couchbase.client.core.CouchbaseException;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.document.json.JsonArray;
 import com.couchbase.client.java.document.json.JsonObject;
 import com.couchbase.client.java.query.N1qlQuery;
+import com.couchbase.client.java.query.N1qlQueryResult;
 import com.couchbase.client.java.query.N1qlQueryRow;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
 import org.janusgraph.diskstorage.*;
 import org.janusgraph.diskstorage.keycolumnvalue.*;
 import org.janusgraph.diskstorage.util.RecordIterator;
-import org.janusgraph.diskstorage.util.StaticArrayBuffer;
 import org.janusgraph.diskstorage.util.StaticArrayEntry;
 import org.janusgraph.diskstorage.util.StaticArrayEntryList;
-import org.janusgraph.util.system.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.Closeable;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
-/**
- *
- */
 public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
-
     private static final Logger logger = LoggerFactory.getLogger(CouchbaseKeyColumnValueStore.class);
-
     private final String bucketName;
     private final Bucket bucket;
     private final CouchbaseStoreManager storeManager;
@@ -59,13 +40,13 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     }
 
     @Override
-    public void close() throws BackendException {
+    public void close() {
     }
 
     @Override
     public EntryList getSlice(KeySliceQuery query, StoreTransaction txh) throws BackendException {
         final List<N1qlQueryRow> rows = query(Collections.singletonList(query.getKey()), null, null,
-            query.getSliceStart(), query.getSliceEnd(), query.hasLimit() ? query.getLimit() : 0);
+            query.getSliceStart(), query.getSliceEnd(), query.hasLimit() ? query.getLimit() : 0).allRows();
 
         if (rows.isEmpty())
             return EntryList.EMPTY_LIST;
@@ -80,10 +61,10 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     public Map<StaticBuffer, EntryList> getSlice(List<StaticBuffer> keys, SliceQuery query, StoreTransaction txh)
         throws BackendException {
         final List<N1qlQueryRow> rows = query(keys, null, null,
-            query.getSliceStart(), query.getSliceEnd(), getLimit(query));
+            query.getSliceStart(), query.getSliceEnd(), getLimit(query)).allRows();
 
         return rows.stream().collect(Collectors.toMap(
-            row -> CouchbaseColumnConverter.INSTANCE.toStaticBuffer(row.value().getString(CouchbaseColumn.ID)),
+            row -> getRowId(row),
             row -> StaticArrayEntryList.ofByteBuffer(row.value().getArray(CouchbaseColumn.COLUMNS).iterator(),
                 entryGetter)
         ));
@@ -92,15 +73,18 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     @Override
     public void mutate(StaticBuffer key, List<Entry> additions, List<StaticBuffer> deletions, StoreTransaction txh)
         throws BackendException {
-        Map<StaticBuffer, KCVMutation> mutations = ImmutableMap.of(key, new KCVMutation(additions, deletions));
-        storeManager.mutateMany(ImmutableMap.of(table, mutations), txh);
+        final String documentId = CouchbaseColumnConverter.INSTANCE.toString(key);
+        logger.info("MUTATE ROWID="+documentId);
+        final CouchbaseDocumentMutation docMutation = new CouchbaseDocumentMutation(table, documentId,
+            new KCVMutation(additions, deletions));
+        storeManager.mutate(docMutation, txh);
     }
 
     @Override
     public void acquireLock(StaticBuffer key,
                             StaticBuffer column,
                             StaticBuffer expectedValue,
-                            StoreTransaction txh) throws BackendException {
+                            StoreTransaction txh) {
         throw new UnsupportedOperationException();
     }
 
@@ -121,18 +105,15 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
             getLimit(query));
     }
 
-    private KeyIterator executeKeySliceQuery(StaticBuffer keyStart, StaticBuffer keyEnd,
-                                             StaticBuffer sliceStart, StaticBuffer sliceEnd, int limit) {
-
-        final List<N1qlQueryRow> rows = query(null, keyStart, keyEnd, sliceStart, sliceEnd, limit);
-
-        // TODO
-
-        return null;
+    private KeyIterator executeKeySliceQuery(StaticBuffer keyStart, StaticBuffer keyEnd, StaticBuffer sliceStart,
+                                             StaticBuffer sliceEnd, int limit) throws BackendException {
+        final N1qlQueryResult queryResult = query(null, keyStart, keyEnd, sliceStart, sliceEnd, limit);
+        return new RowIterator(queryResult.iterator());
     }
 
-    private List<N1qlQueryRow> query(List<StaticBuffer> keys, StaticBuffer keyStart, StaticBuffer keyEnd,
-                                     StaticBuffer sliceStart, StaticBuffer sliceEnd, int limit) {
+    private N1qlQueryResult query(List<StaticBuffer> keys, StaticBuffer keyStart, StaticBuffer keyEnd,
+                                  StaticBuffer sliceStart, StaticBuffer sliceEnd, int limit)
+        throws BackendException {
         final long currentTimeMillis = storeManager.currentTimeMillis();
         final StringBuilder select = new StringBuilder("SELECT");
         final StringBuilder where = new StringBuilder(" WHERE table = $table");
@@ -165,21 +146,22 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
             }
         }
 
-        select.append(" ARRAY a FOR a IN columns WHEN a.writetime + a.ttl > $curtime"); // TODO change to '> ").append(currentTimeMillis)' if it's not working
-        where.append(" AND ANY a IN columns SATISFIES a.writetime + a.ttl > $curtime");
+        // TODO it's not working if ttl=0 Change to Integer.max
+        select.append(" ARRAY a FOR a IN columns WHEN a.`writetime` + a.`ttl` > $curtime"); // TODO change to '> ").append(currentTimeMillis)' if it's not working
+        where.append(" AND ANY a IN columns SATISFIES a.`writetime` + a.`ttl` > $curtime");
 
 
         if (sliceStart != null) {
             final String sliceStartString = CouchbaseColumnConverter.INSTANCE.toString(sliceStart);
-            select.append(" AND a.key >= $sliceStart"); // TODO change to '>= ").append(sliceStartString)' if it's not working
-            where.append(" AND a.key >= $sliceStart");
+            select.append(" AND a.`key` >= $sliceStart"); // TODO change to '>= ").append(sliceStartString)' if it's not working
+            where.append(" AND a.`key` >= $sliceStart");
             placeholderValues.put("$sliceStart", sliceStartString);
         }
 
         if (sliceEnd != null) {
             final String sliceEndString = CouchbaseColumnConverter.INSTANCE.toString(sliceEnd);
-            select.append(" AND a.key < $sliceEnd"); // TODO change to '< ").append(sliceEndString)' if it's not working
-            where.append(" AND a.key < $sliceEnd");
+            select.append(" AND a.`key` < $sliceEnd"); // TODO change to '< ").append(sliceEndString)' if it's not working
+            where.append(" AND a.`key` < $sliceEnd");
             placeholderValues.put("$sliceEnd", sliceEndString);
         }
 
@@ -195,7 +177,15 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
             select.append(" FROM `").append(bucketName).append("`").append(where).toString(),
             placeholderValues);
 
-        return bucket.query(n1qlQuery).allRows();
+        try {
+            return bucket.query(n1qlQuery);
+        } catch (CouchbaseException e) {
+            throw new TemporaryBackendException(e);
+        }
+    }
+
+    private StaticBuffer getRowId(N1qlQueryRow row) {
+        return CouchbaseColumnConverter.INSTANCE.toStaticBuffer(row.value().getString(CouchbaseColumn.ID));
     }
 
     private int getLimit(SliceQuery query) {
@@ -244,17 +234,13 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     }
 
     private class RowIterator implements KeyIterator {
-        private final Closeable table;
-        private final Iterator<Result> rows;
-        private final byte[] columnFamilyBytes;
-
-        private Result currentRow;
+        private final Iterator<N1qlQueryRow> rows;
+        private N1qlQueryRow currentRow;
         private boolean isClosed;
 
-        public RowIterator(Closeable table, ResultScanner rows, byte[] columnFamilyBytes) {
-            this.table = table;
-            this.columnFamilyBytes = Arrays.copyOf(columnFamilyBytes, columnFamilyBytes.length);
-            this.rows = Iterators.filter(rows.iterator(), result -> null != result && null != result.getRow());
+        public RowIterator(Iterator<N1qlQueryRow> rowIterator) {
+            this.rows = Iterators.filter(rowIterator,
+                row -> null != row && null != row.value().getString(CouchbaseColumn.ID));
         }
 
         @Override
@@ -262,24 +248,20 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
             ensureOpen();
 
             return new RecordIterator<Entry>() {
-                private final Iterator<Map.Entry<byte[], NavigableMap<Long, byte[]>>> kv;
-
-                {
-                    final Map<byte[], NavigableMap<byte[], NavigableMap<Long, byte[]>>> map = currentRow.getMap();
-                    Preconditions.checkNotNull(map);
-                    kv = map.get(columnFamilyBytes).entrySet().iterator();
-                }
+                private final Iterator<Entry> columns =
+                    StaticArrayEntryList.ofByteBuffer(currentRow.value().getArray(CouchbaseColumn.COLUMNS).iterator(),
+                        entryGetter).reuseIterator();
 
                 @Override
                 public boolean hasNext() {
                     ensureOpen();
-                    return kv.hasNext();
+                    return columns.hasNext();
                 }
 
                 @Override
                 public Entry next() {
                     ensureOpen();
-                    return StaticArrayEntry.ofBytes(kv.next(), entryGetter);
+                    return columns.next();
                 }
 
                 @Override
@@ -305,14 +287,12 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
             ensureOpen();
 
             currentRow = rows.next();
-            return StaticArrayBuffer.of(currentRow.getRow());
+            return getRowId(currentRow);
         }
 
         @Override
         public void close() {
-            IOUtils.closeQuietly(table);
             isClosed = true;
-            logger.debug("RowIterator closed table {}", table);
         }
 
         @Override

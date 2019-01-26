@@ -25,6 +25,7 @@ public class CouchbaseColumnConverter implements StaticBuffer.Factory<String> {
     }
 
     public StaticBuffer toStaticBuffer(String value) {
+        System.out.println("ROWID="+value);
         return new StaticArrayBuffer(toByteArray(value));
     }
 
