@@ -58,8 +58,8 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     // Immutable instance fields
     private final String bucketName;
     private final Cluster cluster;
-    private final Bucket bucket;
     private final BucketHelper bucketHelper;
+    private Bucket bucket;
 
     // Mutable instance state
     private final ConcurrentMap<String, CouchbaseKeyColumnValueStore> openStores;
@@ -71,13 +71,12 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     public CouchbaseStoreManager(org.janusgraph.diskstorage.configuration.Configuration config) throws BackendException {
         super(config, PORT_DEFAULT);
 
-        this.bucketName = determineTableName(config);
-
-        bucketHelper = new BucketHelper(hostnames[0], port, "janusgraph", "janusgraph"); // TODO fix
-        ensureBucketExists();
         cluster = CouchbaseCluster.create(hostnames);
         cluster.authenticate("janusgraph", "janusgraph"); // TODO change to authenticate(username, password);
-        bucket = cluster.openBucket(bucketName);
+
+        this.bucketName = determineTableName(config);
+        bucketHelper = new BucketHelper(hostnames[0], port, "janusgraph", "janusgraph"); // TODO fix
+        ensureBucketExists();
 
 //
 //        shortCfNameMap = createShortCfMap(config);
@@ -292,20 +291,28 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
         if (mutation.hasAdditions()) {
             for (Entry e : mutation.getAdditions()) {
-                Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
+                final int ttl = getTtl(e);
 
-                columns.put(e.getColumnAs(CouchbaseColumnConverter.INSTANCE), new CouchbaseColumn(
-                    e.getValueAs(CouchbaseColumnConverter.INSTANCE), currentTimeMillis,
-                    null != ttl && ttl > 0 ? ttl : 0));
+                columns.put(CouchbaseColumnConverter.INSTANCE.toString(e.getColumn()), new CouchbaseColumn(
+                    CouchbaseColumnConverter.INSTANCE.toString(e.getValue()), getExpire(currentTimeMillis, ttl), ttl));
             }
         }
 
         if (mutation.hasDeletions()) {
             for (StaticBuffer b : mutation.getDeletions())
-                columns.remove(b.as(CouchbaseColumnConverter.INSTANCE));
+                columns.remove(CouchbaseColumnConverter.INSTANCE.toString(b));
         }
 
         return columns;
+    }
+
+    private long getExpire(long writetime, int ttl) {
+        return writetime + ttl * 1000L;
+    }
+
+    private int getTtl(Entry e) {
+        final Integer ttl = (Integer) e.getMetaData().get(EntryMetaData.TTL);
+        return null != ttl && ttl > 0 ? ttl : Integer.MAX_VALUE;
     }
 
     private void updateColumns(JsonDocument document, Map<String, CouchbaseColumn> columns) {
@@ -313,7 +320,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             JsonObject.create()
                 .put(CouchbaseColumn.KEY, entry.getKey())
                 .put(CouchbaseColumn.VALUE, entry.getValue().getValue())
-                .put(CouchbaseColumn.WRITE_TIME, entry.getValue().getWritetime())
+                .put(CouchbaseColumn.EXPIRE, entry.getValue().getExpire())
                 .put(CouchbaseColumn.TTL, entry.getValue().getTtl())
         ).collect(Collectors.toList());
 
@@ -325,12 +332,13 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         final Iterator it = document.content().getArray(CouchbaseColumn.COLUMNS).iterator();
 
         while (it.hasNext()) {
-            JsonObject column = (JsonObject) it.next();
-            long writetime = column.getLong(CouchbaseColumn.WRITE_TIME);
-            int ttl = column.getInt(CouchbaseColumn.TTL);
-            if (ttl == 0 || writetime + ttl > currentTimeMillis)
+            final JsonObject column = (JsonObject) it.next();
+            final long expire = column.getLong(CouchbaseColumn.EXPIRE);
+
+            if (expire > currentTimeMillis)
                 columns.put(column.getString(CouchbaseColumn.KEY),
-                    new CouchbaseColumn(column.getString(CouchbaseColumn.VALUE), writetime, ttl));
+                    new CouchbaseColumn(column.getString(CouchbaseColumn.VALUE), expire,
+                        column.getInt(CouchbaseColumn.TTL)));
         }
 
         return columns;
@@ -395,17 +403,12 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         logger.info("clearStorage");
         if (this.storageConfig.get(GraphDatabaseConfiguration.DROP_ON_CLEAR)) {
             bucketHelper.drop(bucketName);
-        } else {
-            if (exists())
-                bucketHelper.drop(bucketName);
-            createBucket();
-            // TODO not working
-//            try {
-//                N1qlQueryResult queryResult = bucket.query(deleteFrom(bucketName));
-//                System.out.println(queryResult.status());
-//            } catch (CouchbaseException e) {
-//                throw new TemporaryBackendException(e);
-//            }
+        } else { // TODO replace to truncate
+            try {
+                bucket.query(deleteFrom(bucketName));
+            } catch (CouchbaseException e) {
+                throw new TemporaryBackendException(e);
+            }
         }
     }
 
@@ -421,16 +424,19 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
     private void ensureBucketExists() throws BackendException {
         logger.info("ensureBucketExists");
-        if (!exists()) {
+        if (!exists())
             createBucket();
-        }
+        else if (bucket == null)
+            bucket = cluster.openBucket(bucketName);
     }
 
     private void createBucket() throws BackendException {
         // TODO put params to config
         bucketHelper.create(bucketName, "couchbase", 2000);
-        bucket.query(N1qlQuery.simple("CREATE PRIMARY INDEX `" + bucketName + "_primary` ON `" +
+        bucket = cluster.openBucket(bucketName);
+        N1qlQueryResult res = bucket.query(N1qlQuery.simple("CREATE PRIMARY INDEX `" + bucketName + "_primary` ON `" +
             bucketName + "` WITH { \"defer_build\":false }"));
+ //       logger.info("Create index res = " + res.status());
     }
 
     private String determineTableName(org.janusgraph.diskstorage.configuration.Configuration config) {

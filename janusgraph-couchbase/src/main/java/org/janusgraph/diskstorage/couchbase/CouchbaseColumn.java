@@ -7,16 +7,16 @@ public class CouchbaseColumn {
     public static final String COLUMNS = "columns";
     public static final String KEY = "key";
     public static final String VALUE = "value";
-    public static final String WRITE_TIME = "writetime";
+    public static final String EXPIRE = "expire";
     public static final String TTL = "ttl";
     // instance members
     private String value;
-    private long writetime;
+    private long expire;
     private int ttl;
 
-    public CouchbaseColumn(String value, long writetime, int ttl) {
+    public CouchbaseColumn(String value, long expire, int ttl) {
         this.value = value;
-        this.writetime = writetime;
+        this.expire = expire;
         this.ttl = ttl;
     }
 
@@ -24,8 +24,8 @@ public class CouchbaseColumn {
         return value;
     }
 
-    public long getWritetime() {
-        return writetime;
+    public long getExpire() {
+        return expire;
     }
 
     public int getTtl() {

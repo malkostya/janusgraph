@@ -16,7 +16,6 @@ import org.janusgraph.diskstorage.util.StaticArrayEntryList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -43,6 +42,17 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     public void close() {
     }
 
+    public static void main(String[] args) {
+        byte[] b = new byte[]{
+            0, 0, 0, 0, 0, 0, 3, -24
+        };
+          String s = CouchbaseColumnConverter.INSTANCE.toString(b);
+         System.out.println(s);
+        byte[] b1 = CouchbaseColumnConverter.INSTANCE.toByteArray(s);
+
+        System.out.println(b1);
+    }
+
     @Override
     public EntryList getSlice(KeySliceQuery query, StoreTransaction txh) throws BackendException {
         final List<N1qlQueryRow> rows = query(Collections.singletonList(query.getKey()), null, null,
@@ -52,7 +62,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
             return EntryList.EMPTY_LIST;
         else if (rows.size() == 1) {
             final JsonArray columns = rows.get(0).value().getArray(CouchbaseColumn.COLUMNS);
-            return StaticArrayEntryList.ofByteBuffer(columns.iterator(), entryGetter);
+            return StaticArrayEntryList.ofBytes(columns, entryGetter);
         } else
             throw new TemporaryBackendException("Multiple rows with the same key.");
     }
@@ -65,7 +75,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
         return rows.stream().collect(Collectors.toMap(
             row -> getRowId(row),
-            row -> StaticArrayEntryList.ofByteBuffer(row.value().getArray(CouchbaseColumn.COLUMNS).iterator(),
+            row -> StaticArrayEntryList.ofBytes(row.value().getArray(CouchbaseColumn.COLUMNS),
                 entryGetter)
         ));
     }
@@ -74,7 +84,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     public void mutate(StaticBuffer key, List<Entry> additions, List<StaticBuffer> deletions, StoreTransaction txh)
         throws BackendException {
         final String documentId = CouchbaseColumnConverter.INSTANCE.toString(key);
-        logger.info("MUTATE ROWID="+documentId);
+        logger.info("MUTATE ROWID=" + documentId);
         final CouchbaseDocumentMutation docMutation = new CouchbaseDocumentMutation(table, documentId,
             new KCVMutation(additions, deletions));
         storeManager.mutate(docMutation, txh);
@@ -146,9 +156,8 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
             }
         }
 
-        // TODO it's not working if ttl=0 Change to Integer.max
-        select.append(" ARRAY a FOR a IN columns WHEN a.`writetime` + a.`ttl` > $curtime"); // TODO change to '> ").append(currentTimeMillis)' if it's not working
-        where.append(" AND ANY a IN columns SATISFIES a.`writetime` + a.`ttl` > $curtime");
+        select.append(" ARRAY a FOR a IN columns WHEN a.`expire` > $curtime"); // TODO change to '> ").append(currentTimeMillis)' if it's not working
+        where.append(" AND ANY a IN columns SATISFIES a.`expire` > $curtime");
 
 
         if (sliceStart != null) {
@@ -192,7 +201,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         return query.hasLimit() ? query.getLimit() : 0;
     }
 
-    private static class CouchbaseGetter implements StaticArrayEntry.GetColVal<Object, ByteBuffer> {
+    private static class CouchbaseGetter implements StaticArrayEntry.GetColVal<Object, byte[]> {
 
         private final EntryMetaData[] schema;
 
@@ -201,13 +210,13 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         }
 
         @Override
-        public ByteBuffer getColumn(Object element) {
-            return asByteBuffer(element, CouchbaseColumn.KEY);
+        public byte[] getColumn(Object element) {
+            return asBytes(element, CouchbaseColumn.KEY);
         }
 
         @Override
-        public ByteBuffer getValue(Object element) {
-            return asByteBuffer(element, CouchbaseColumn.VALUE);
+        public byte[] getValue(Object element) {
+            return asBytes(element, CouchbaseColumn.VALUE);
         }
 
         @Override
@@ -219,17 +228,19 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         public Object getMetaData(Object element, EntryMetaData meta) {
             switch (meta) {
                 case TIMESTAMP:
-                    return ((JsonObject) element).getLong(CouchbaseColumn.WRITE_TIME);
+                    final JsonObject column = (JsonObject) element;
+                    return column.getLong(CouchbaseColumn.EXPIRE) - column.getInt(CouchbaseColumn.TTL) * 1000L;
                 case TTL:
-                    return ((JsonObject) element).getInt(CouchbaseColumn.TTL);
+                    final int ttl = ((JsonObject) element).getInt(CouchbaseColumn.TTL);
+                    return ttl == Integer.MAX_VALUE ? 0 : ttl;
                 default:
                     throw new UnsupportedOperationException("Unsupported meta data: " + meta);
             }
         }
 
-        private ByteBuffer asByteBuffer(Object element, String elementKey) {
+        private byte[] asBytes(Object element, String elementKey) {
             final String elementValue = ((JsonObject) element).getString(elementKey);
-            return CouchbaseColumnConverter.INSTANCE.toByteBuffer(elementValue);
+            return CouchbaseColumnConverter.INSTANCE.toByteArray(elementValue);
         }
     }
 
@@ -249,7 +260,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
             return new RecordIterator<Entry>() {
                 private final Iterator<Entry> columns =
-                    StaticArrayEntryList.ofByteBuffer(currentRow.value().getArray(CouchbaseColumn.COLUMNS).iterator(),
+                    StaticArrayEntryList.ofBytes(currentRow.value().getArray(CouchbaseColumn.COLUMNS),
                         entryGetter).reuseIterator();
 
                 @Override

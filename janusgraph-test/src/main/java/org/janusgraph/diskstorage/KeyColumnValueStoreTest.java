@@ -243,6 +243,7 @@ public abstract class KeyColumnValueStoreTest extends AbstractKCVSTest {
                 if (removed.contains(new KeyColumn(i, j))) {
                     Assert.assertNull(result);
                 } else {
+
                     Assert.assertEquals(values[i][j], KeyValueStoreUtil.getString(result));
                 }
             }
