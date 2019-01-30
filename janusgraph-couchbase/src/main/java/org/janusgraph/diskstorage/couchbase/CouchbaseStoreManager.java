@@ -40,6 +40,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
     private static final Logger logger = LoggerFactory.getLogger(CouchbaseStoreManager.class);
 
+    private static final CouchbaseColumnConverter columnConverter = CouchbaseColumnConverter.INSTANCE;
     public static final ConfigNamespace COUCHBASE_NS =
         new ConfigNamespace(GraphDatabaseConfiguration.STORAGE_NS, "couchbase", "Couchbase storage options");
 
@@ -292,15 +293,15 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         if (mutation.hasAdditions()) {
             for (Entry e : mutation.getAdditions()) {
                 final int ttl = getTtl(e);
-
-                columns.put(CouchbaseColumnConverter.INSTANCE.toString(e.getColumn()), new CouchbaseColumn(
-                    CouchbaseColumnConverter.INSTANCE.toString(e.getValue()), getExpire(currentTimeMillis, ttl), ttl));
+                final String key = columnConverter.toString(e.getColumn());
+                columns.put(key, new CouchbaseColumn(key,
+                    columnConverter.toString(e.getValue()), getExpire(currentTimeMillis, ttl), ttl));
             }
         }
 
         if (mutation.hasDeletions()) {
             for (StaticBuffer b : mutation.getDeletions())
-                columns.remove(CouchbaseColumnConverter.INSTANCE.toString(b));
+                columns.remove(columnConverter.toString(b));
         }
 
         return columns;
@@ -335,10 +336,11 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             final JsonObject column = (JsonObject) it.next();
             final long expire = column.getLong(CouchbaseColumn.EXPIRE);
 
-            if (expire > currentTimeMillis)
-                columns.put(column.getString(CouchbaseColumn.KEY),
-                    new CouchbaseColumn(column.getString(CouchbaseColumn.VALUE), expire,
-                        column.getInt(CouchbaseColumn.TTL)));
+            if (expire > currentTimeMillis) {
+                final String key = column.getString(CouchbaseColumn.KEY);
+                columns.put(key, new CouchbaseColumn(key, column.getString(CouchbaseColumn.VALUE), expire,
+                    column.getInt(CouchbaseColumn.TTL)));
+            }
         }
 
         return columns;
@@ -354,7 +356,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
             Map<StaticBuffer, KCVMutation> mutations = batchEntry.getValue();
             for (Map.Entry<StaticBuffer, KCVMutation> ent : mutations.entrySet()) {
                 KCVMutation mutation = ent.getValue();
-                String id = CouchbaseColumnConverter.INSTANCE.toString(ent.getKey());
+                String id = columnConverter.toString(ent.getKey());
                 documentMutations.add(new CouchbaseDocumentMutation(table, id, mutation));
             }
         }
@@ -436,7 +438,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         bucket = cluster.openBucket(bucketName);
         N1qlQueryResult res = bucket.query(N1qlQuery.simple("CREATE PRIMARY INDEX `" + bucketName + "_primary` ON `" +
             bucketName + "` WITH { \"defer_build\":false }"));
- //       logger.info("Create index res = " + res.status());
+        //       logger.info("Create index res = " + res.status());
     }
 
     private String determineTableName(org.janusgraph.diskstorage.configuration.Configuration config) {

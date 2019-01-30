@@ -4,9 +4,11 @@ import com.couchbase.client.core.CouchbaseException;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.document.json.JsonArray;
 import com.couchbase.client.java.document.json.JsonObject;
+import com.couchbase.client.java.query.N1qlParams;
 import com.couchbase.client.java.query.N1qlQuery;
 import com.couchbase.client.java.query.N1qlQueryResult;
 import com.couchbase.client.java.query.N1qlQueryRow;
+import com.couchbase.client.java.query.consistency.ScanConsistency;
 import com.google.common.collect.Iterators;
 import org.janusgraph.diskstorage.*;
 import org.janusgraph.diskstorage.keycolumnvalue.*;
@@ -16,14 +18,12 @@ import org.janusgraph.diskstorage.util.StaticArrayEntryList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.stream.Collectors;
 
 public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     private static final Logger logger = LoggerFactory.getLogger(CouchbaseKeyColumnValueStore.class);
+    private static final CouchbaseColumnConverter columnConverter = CouchbaseColumnConverter.INSTANCE;
     private final String bucketName;
     private final Bucket bucket;
     private final CouchbaseStoreManager storeManager;
@@ -43,12 +43,14 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     }
 
     public static void main(String[] args) {
+        System.out.println("abc123".compareTo("ABC223"));
+
         byte[] b = new byte[]{
             0, 0, 0, 0, 0, 0, 3, -24
         };
-          String s = CouchbaseColumnConverter.INSTANCE.toString(b);
-         System.out.println(s);
-        byte[] b1 = CouchbaseColumnConverter.INSTANCE.toByteArray(s);
+        String s = columnConverter.toString(b);
+        System.out.println(s);
+        byte[] b1 = columnConverter.toByteArray(s);
 
         System.out.println(b1);
     }
@@ -56,13 +58,13 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     @Override
     public EntryList getSlice(KeySliceQuery query, StoreTransaction txh) throws BackendException {
         final List<N1qlQueryRow> rows = query(Collections.singletonList(query.getKey()), null, null,
-            query.getSliceStart(), query.getSliceEnd(), query.hasLimit() ? query.getLimit() : 0).allRows();
+            query.getSliceStart(), query.getSliceEnd()).allRows();
 
         if (rows.isEmpty())
             return EntryList.EMPTY_LIST;
         else if (rows.size() == 1) {
             final JsonArray columns = rows.get(0).value().getArray(CouchbaseColumn.COLUMNS);
-            return StaticArrayEntryList.ofBytes(columns, entryGetter);
+            return StaticArrayEntryList.ofBytes(convertAndSortColumns(columns, getLimit(query)), entryGetter);
         } else
             throw new TemporaryBackendException("Multiple rows with the same key.");
     }
@@ -71,19 +73,19 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     public Map<StaticBuffer, EntryList> getSlice(List<StaticBuffer> keys, SliceQuery query, StoreTransaction txh)
         throws BackendException {
         final List<N1qlQueryRow> rows = query(keys, null, null,
-            query.getSliceStart(), query.getSliceEnd(), getLimit(query)).allRows();
+            query.getSliceStart(), query.getSliceEnd()).allRows();
 
         return rows.stream().collect(Collectors.toMap(
             row -> getRowId(row),
-            row -> StaticArrayEntryList.ofBytes(row.value().getArray(CouchbaseColumn.COLUMNS),
-                entryGetter)
+            row -> StaticArrayEntryList.ofBytes(convertAndSortColumns(row.value().getArray(CouchbaseColumn.COLUMNS),
+                getLimit(query)), entryGetter)
         ));
     }
 
     @Override
     public void mutate(StaticBuffer key, List<Entry> additions, List<StaticBuffer> deletions, StoreTransaction txh)
         throws BackendException {
-        final String documentId = CouchbaseColumnConverter.INSTANCE.toString(key);
+        final String documentId = columnConverter.toString(key);
         logger.info("MUTATE ROWID=" + documentId);
         final CouchbaseDocumentMutation docMutation = new CouchbaseDocumentMutation(table, documentId,
             new KCVMutation(additions, deletions));
@@ -117,12 +119,12 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
     private KeyIterator executeKeySliceQuery(StaticBuffer keyStart, StaticBuffer keyEnd, StaticBuffer sliceStart,
                                              StaticBuffer sliceEnd, int limit) throws BackendException {
-        final N1qlQueryResult queryResult = query(null, keyStart, keyEnd, sliceStart, sliceEnd, limit);
-        return new RowIterator(queryResult.iterator());
+        final N1qlQueryResult queryResult = query(null, keyStart, keyEnd, sliceStart, sliceEnd);
+        return new RowIterator(queryResult.iterator(), limit);
     }
 
     private N1qlQueryResult query(List<StaticBuffer> keys, StaticBuffer keyStart, StaticBuffer keyEnd,
-                                  StaticBuffer sliceStart, StaticBuffer sliceEnd, int limit)
+                                  StaticBuffer sliceStart, StaticBuffer sliceEnd)
         throws BackendException {
         final long currentTimeMillis = storeManager.currentTimeMillis();
         final StringBuilder select = new StringBuilder("SELECT");
@@ -134,12 +136,12 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         if (keys != null) {
             if (keys.size() == 1) {
                 where.append(" AND meta().id = $key");
-                placeholderValues.put("key", CouchbaseColumnConverter.INSTANCE.toString(keys.get(0)));
+                placeholderValues.put("key", columnConverter.toString(keys.get(0)));
             } else {
                 select.append(" meta().id AS id,");
                 where.append(" AND meta().id IN [");
                 for (StaticBuffer key : keys)
-                    where.append(CouchbaseColumnConverter.INSTANCE.toString(key)).append(", ");
+                    where.append(columnConverter.toString(key)).append(", ");
                 where.delete(where.length() - 2, where.length()).append("]");
             }
         } else {
@@ -147,29 +149,29 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
             if (keyStart != null) {
                 where.append(" AND meta().id >= $keyStart");
-                placeholderValues.put("keyStart", CouchbaseColumnConverter.INSTANCE.toString(keyStart));
+                placeholderValues.put("keyStart", columnConverter.toString(keyStart));
             }
 
             if (keyEnd != null) {
                 where.append(" AND meta().id < $keyEnd");
-                placeholderValues.put("keyEnd", CouchbaseColumnConverter.INSTANCE.toString(keyEnd));
+                placeholderValues.put("keyEnd", columnConverter.toString(keyEnd));
             }
         }
 
-        select.append(" ARRAY a FOR a IN columns WHEN a.`expire` > $curtime"); // TODO change to '> ").append(currentTimeMillis)' if it's not working
+        select.append(" ARRAY a FOR a IN columns WHEN a.`expire` > $curtime");
         where.append(" AND ANY a IN columns SATISFIES a.`expire` > $curtime");
 
 
         if (sliceStart != null) {
-            final String sliceStartString = CouchbaseColumnConverter.INSTANCE.toString(sliceStart);
-            select.append(" AND a.`key` >= $sliceStart"); // TODO change to '>= ").append(sliceStartString)' if it's not working
+            final String sliceStartString = columnConverter.toString(sliceStart);
+            select.append(" AND a.`key` >= $sliceStart");
             where.append(" AND a.`key` >= $sliceStart");
             placeholderValues.put("$sliceStart", sliceStartString);
         }
 
         if (sliceEnd != null) {
-            final String sliceEndString = CouchbaseColumnConverter.INSTANCE.toString(sliceEnd);
-            select.append(" AND a.`key` < $sliceEnd"); // TODO change to '< ").append(sliceEndString)' if it's not working
+            final String sliceEndString = columnConverter.toString(sliceEnd);
+            select.append(" AND a.`key` < $sliceEnd");
             where.append(" AND a.`key` < $sliceEnd");
             placeholderValues.put("$sliceEnd", sliceEndString);
         }
@@ -177,14 +179,11 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         select.append(" END as columns");
         where.append(" END");
 
-        if (limit > 0) {
-            where.append(" LIMIT $limit");
-            placeholderValues.put("limit", limit);
-        }
+        final N1qlParams params = N1qlParams.build().consistency(ScanConsistency.STATEMENT_PLUS); // TODO change to AtPlus
 
         final N1qlQuery n1qlQuery = N1qlQuery.parameterized(
             select.append(" FROM `").append(bucketName).append("`").append(where).toString(),
-            placeholderValues);
+            placeholderValues, params);
 
         try {
             return bucket.query(n1qlQuery);
@@ -194,15 +193,34 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     }
 
     private StaticBuffer getRowId(N1qlQueryRow row) {
-        return CouchbaseColumnConverter.INSTANCE.toStaticBuffer(row.value().getString(CouchbaseColumn.ID));
+        return columnConverter.toStaticBuffer(row.value().getString(CouchbaseColumn.ID));
     }
 
     private int getLimit(SliceQuery query) {
         return query.hasLimit() ? query.getLimit() : 0;
     }
 
-    private static class CouchbaseGetter implements StaticArrayEntry.GetColVal<Object, byte[]> {
+    private List<CouchbaseColumn> convertAndSortColumns(JsonArray columnsArray, int limit) {
+        final Iterator itr = columnsArray.iterator();
+        final List<CouchbaseColumn> columns = new ArrayList<>(columnsArray.size());
 
+        while (itr.hasNext()) {
+            final JsonObject column = (JsonObject) itr.next();
+            columns.add(new CouchbaseColumn(
+                column.getString(CouchbaseColumn.KEY),
+                column.getString(CouchbaseColumn.VALUE),
+                column.getLong(CouchbaseColumn.EXPIRE),
+                column.getInt(CouchbaseColumn.TTL)));
+        }
+
+        columns.sort(Comparator.naturalOrder());
+
+        return limit ==0 || limit >= columns.size() ? columns : columns.subList(0, limit);
+    }
+
+    private static class CouchbaseGetter implements StaticArrayEntry.GetColVal<CouchbaseColumn, byte[]> {
+
+        private static final CouchbaseColumnConverter columnConverter = CouchbaseColumnConverter.INSTANCE;
         private final EntryMetaData[] schema;
 
         private CouchbaseGetter(EntryMetaData[] schema) {
@@ -210,37 +228,31 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         }
 
         @Override
-        public byte[] getColumn(Object element) {
-            return asBytes(element, CouchbaseColumn.KEY);
+        public byte[] getColumn(CouchbaseColumn column) {
+            return columnConverter.toByteArray(column.getKey());
         }
 
         @Override
-        public byte[] getValue(Object element) {
-            return asBytes(element, CouchbaseColumn.VALUE);
+        public byte[] getValue(CouchbaseColumn column) {
+            return columnConverter.toByteArray(column.getValue());
         }
 
         @Override
-        public EntryMetaData[] getMetaSchema(Object element) {
+        public EntryMetaData[] getMetaSchema(CouchbaseColumn column) {
             return schema;
         }
 
         @Override
-        public Object getMetaData(Object element, EntryMetaData meta) {
+        public Object getMetaData(CouchbaseColumn column, EntryMetaData meta) {
             switch (meta) {
                 case TIMESTAMP:
-                    final JsonObject column = (JsonObject) element;
-                    return column.getLong(CouchbaseColumn.EXPIRE) - column.getInt(CouchbaseColumn.TTL) * 1000L;
+                    return column.getExpire() - column.getTtl() * 1000L;
                 case TTL:
-                    final int ttl = ((JsonObject) element).getInt(CouchbaseColumn.TTL);
+                    final int ttl = column.getTtl();
                     return ttl == Integer.MAX_VALUE ? 0 : ttl;
                 default:
                     throw new UnsupportedOperationException("Unsupported meta data: " + meta);
             }
-        }
-
-        private byte[] asBytes(Object element, String elementKey) {
-            final String elementValue = ((JsonObject) element).getString(elementKey);
-            return CouchbaseColumnConverter.INSTANCE.toByteArray(elementValue);
         }
     }
 
@@ -248,8 +260,10 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
         private final Iterator<N1qlQueryRow> rows;
         private N1qlQueryRow currentRow;
         private boolean isClosed;
+        private final int limit;
 
-        public RowIterator(Iterator<N1qlQueryRow> rowIterator) {
+        public RowIterator(Iterator<N1qlQueryRow> rowIterator, int limit) {
+            this.limit = limit;
             this.rows = Iterators.filter(rowIterator,
                 row -> null != row && null != row.value().getString(CouchbaseColumn.ID));
         }
@@ -260,7 +274,8 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
             return new RecordIterator<Entry>() {
                 private final Iterator<Entry> columns =
-                    StaticArrayEntryList.ofBytes(currentRow.value().getArray(CouchbaseColumn.COLUMNS),
+                    StaticArrayEntryList.ofBytes(
+                        convertAndSortColumns(currentRow.value().getArray(CouchbaseColumn.COLUMNS), limit),
                         entryGetter).reuseIterator();
 
                 @Override

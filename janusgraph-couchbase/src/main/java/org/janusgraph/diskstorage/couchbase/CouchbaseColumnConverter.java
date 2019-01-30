@@ -36,10 +36,10 @@ public class CouchbaseColumnConverter {//implements StaticBuffer.Factory<String>
         }
         String s = new String(hexChars);
 
-        byte[] b = toByteArray(s);
-        if (!Arrays.equals(bytes, b)) {
-            System.out.println("fail");
-        }
+//        byte[] b = toByteArray(s);
+//        if (!Arrays.equals(bytes, b)) {
+//            System.out.println("fail");
+//        }
 
         return s;
     }
