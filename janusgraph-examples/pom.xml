@@ -19,6 +19,7 @@
         <module>example-hbase</module>
         <module>example-remotegraph</module>
         <module>example-tinkergraph</module>
+        <module>example-couchbase</module>
     </modules>
 
     <dependencies>

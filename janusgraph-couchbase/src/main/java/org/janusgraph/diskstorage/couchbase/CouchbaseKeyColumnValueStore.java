@@ -42,18 +42,18 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     public void close() {
     }
 
-    public static void main(String[] args) {
-        System.out.println("abc123".compareTo("ABC223"));
-
-        byte[] b = new byte[]{
-            0, 0, 0, 0, 0, 0, 3, -24
-        };
-        String s = columnConverter.toString(b);
-        System.out.println(s);
-        byte[] b1 = columnConverter.toByteArray(s);
-
-        System.out.println(b1);
-    }
+//    public static void main(String[] args) {
+//
+//
+//        byte[] b = new byte[]{
+//            0, 0, 0, 0, 0, 0, 3, -24
+//        };
+//        String s = columnConverter.toString(b);
+//        System.out.println(s);
+//        byte[] b1 = columnConverter.toByteArray(s);
+//
+//        System.out.println(b1);
+//    }
 
     @Override
     public EntryList getSlice(KeySliceQuery query, StoreTransaction txh) throws BackendException {
@@ -86,7 +86,6 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     public void mutate(StaticBuffer key, List<Entry> additions, List<StaticBuffer> deletions, StoreTransaction txh)
         throws BackendException {
         final String documentId = columnConverter.toString(key);
-        logger.info("MUTATE ROWID=" + documentId);
         final CouchbaseDocumentMutation docMutation = new CouchbaseDocumentMutation(table, documentId,
             new KCVMutation(additions, deletions));
         storeManager.mutate(docMutation, txh);
@@ -215,7 +214,7 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
 
         columns.sort(Comparator.naturalOrder());
 
-        return limit ==0 || limit >= columns.size() ? columns : columns.subList(0, limit);
+        return limit == 0 || limit >= columns.size() ? columns : columns.subList(0, limit);
     }
 
     private static class CouchbaseGetter implements StaticArrayEntry.GetColVal<CouchbaseColumn, byte[]> {
