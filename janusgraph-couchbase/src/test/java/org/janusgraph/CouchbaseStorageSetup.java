@@ -29,6 +29,11 @@ public class CouchbaseStorageSetup {
 
     private static final Logger log = LoggerFactory.getLogger(CouchbaseStorageSetup.class);
 
+    private static final String DEFAULT_USERNAME = "janusgraph";
+
+    private static final String DEFAULT_PASSWORD = "janusgraph";
+
+
     // Couchbase config for testing
 //
 //    public static final String HBASE_PARENT_DIR_PROP = "test.hbase.parentdir";
@@ -86,6 +91,8 @@ public class CouchbaseStorageSetup {
 
     public static ModifiableConfiguration getCouchbaseConfiguration(String bucketName, String graphName) {
         ModifiableConfiguration config = GraphDatabaseConfiguration.buildGraphConfiguration();
+        config.set(GraphDatabaseConfiguration.AUTH_USERNAME, DEFAULT_USERNAME);
+        config.set(GraphDatabaseConfiguration.AUTH_PASSWORD, DEFAULT_PASSWORD);
         config.set(GraphDatabaseConfiguration.STORAGE_BACKEND, "couchbase");
         if (!StringUtils.isEmpty(bucketName)) config.set(CouchbaseStoreManager.COUCHBASE_BUCKET, bucketName);
         if (!StringUtils.isEmpty(graphName)) config.set(GraphDatabaseConfiguration.GRAPH_NAME, graphName);

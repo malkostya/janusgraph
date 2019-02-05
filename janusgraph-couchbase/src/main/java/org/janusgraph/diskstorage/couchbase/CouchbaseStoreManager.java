@@ -52,6 +52,14 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                 " to that value.",
             ConfigOption.Type.LOCAL, "janusgraph");
 
+    public static final ConfigOption<Integer> RAM_QUOTA_MB =
+        new ConfigOption<Integer>(COUCHBASE_NS, "ram-quota-mb",
+            "Required parameter. RAM Quota for new bucket in MB. Numeric. The minimum you can specify is" +
+                " 100, and the maximum can only be as great as the memory quota established for the node. If other" +
+                " buckets are associated with a node, RAM Quota can only be as large as the amount memory remaining" +
+                " for the node, accounting for the other bucket memory quota.",
+            ConfigOption.Type.MASKABLE, Integer.class, input -> null != input && 100 <= input);
+
     public static final int PORT_DEFAULT = 8091;  // Not used. Just for the parent constructor.
 
     public static final TimestampProviders PREFERRED_TIMESTAMPS = TimestampProviders.MILLI;
@@ -61,6 +69,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     private final Cluster cluster;
     private final BucketHelper bucketHelper;
     private Bucket bucket;
+    private final int ramQuotaMB;
 
     // Mutable instance state
     private final ConcurrentMap<String, CouchbaseKeyColumnValueStore> openStores;
@@ -73,10 +82,11 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         super(config, PORT_DEFAULT);
 
         cluster = CouchbaseCluster.create(hostnames);
-        cluster.authenticate("janusgraph", "janusgraph"); // TODO change to authenticate(username, password);
+        cluster.authenticate(username, password);
 
         this.bucketName = determineTableName(config);
-        bucketHelper = new BucketHelper(hostnames[0], port, "janusgraph", "janusgraph"); // TODO fix
+        this.ramQuotaMB = config.has(RAM_QUOTA_MB) ? config.get(RAM_QUOTA_MB) : 100;
+        bucketHelper = new BucketHelper(hostnames[0], port, username, password);
         ensureBucketExists();
 
 //
@@ -434,7 +444,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
     private void createBucket() throws BackendException {
         // TODO put params to config
-        bucketHelper.create(bucketName, "couchbase", 2000);
+        bucketHelper.create(bucketName, "couchbase", ramQuotaMB);
         bucket = cluster.openBucket(bucketName);
         N1qlQueryResult res = bucket.query(N1qlQuery.simple("CREATE PRIMARY INDEX `" + bucketName + "_primary` ON `" +
             bucketName + "` WITH { \"defer_build\":false }"));
