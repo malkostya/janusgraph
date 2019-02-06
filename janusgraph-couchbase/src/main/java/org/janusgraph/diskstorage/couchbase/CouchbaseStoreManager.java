@@ -1,19 +1,13 @@
 package org.janusgraph.diskstorage.couchbase;
 
 import com.couchbase.client.core.CouchbaseException;
-import com.couchbase.client.java.Bucket;
-import com.couchbase.client.java.Cluster;
-import com.couchbase.client.java.CouchbaseCluster;
 import com.couchbase.client.java.document.JsonDocument;
 import com.couchbase.client.java.document.json.JsonArray;
 import com.couchbase.client.java.document.json.JsonObject;
-import com.couchbase.client.java.query.N1qlQuery;
-import com.couchbase.client.java.query.N1qlQueryResult;
 import com.google.common.base.Preconditions;
 import org.janusgraph.diskstorage.*;
 import org.janusgraph.diskstorage.common.DistributedStoreManager;
 import org.janusgraph.diskstorage.configuration.ConfigNamespace;
-import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.keycolumnvalue.*;
 import org.janusgraph.diskstorage.util.time.TimestampProviders;
@@ -23,14 +17,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import rx.Observable;
 
-import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
-
-import static com.couchbase.client.java.query.Delete.deleteFrom;
-import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GRAPH_NAME;
 
 /**
  * Storage Manager for Couchbase
@@ -44,32 +34,13 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     public static final ConfigNamespace COUCHBASE_NS =
         new ConfigNamespace(GraphDatabaseConfiguration.STORAGE_NS, "couchbase", "Couchbase storage options");
 
-    public static final ConfigOption<String> COUCHBASE_BUCKET =
-        new ConfigOption<>(COUCHBASE_NS, "bucket",
-            "The name of the bucket JanusGraph will use. JanusGraph is not able to create a new bucket but" +
-                " should use predefined one." +
-                " If this configuration option is not provided but graph.graphname is, the bucket will be set" +
-                " to that value.",
-            ConfigOption.Type.LOCAL, "janusgraph");
-
-    public static final ConfigOption<Integer> RAM_QUOTA_MB =
-        new ConfigOption<Integer>(COUCHBASE_NS, "ram-quota-mb",
-            "Required parameter. RAM Quota for new bucket in MB. Numeric. The minimum you can specify is" +
-                " 100, and the maximum can only be as great as the memory quota established for the node. If other" +
-                " buckets are associated with a node, RAM Quota can only be as large as the amount memory remaining" +
-                " for the node, accounting for the other bucket memory quota.",
-            ConfigOption.Type.MASKABLE, Integer.class, input -> null != input && 100 <= input);
 
     public static final int PORT_DEFAULT = 8091;  // Not used. Just for the parent constructor.
 
     public static final TimestampProviders PREFERRED_TIMESTAMPS = TimestampProviders.MILLI;
 
     // Immutable instance fields
-    private final String bucketName;
-    private final Cluster cluster;
-    private final BucketHelper bucketHelper;
-    private Bucket bucket;
-    private final int ramQuotaMB;
+    private final BucketWrapper bucket;
 
     // Mutable instance state
     private final ConcurrentMap<String, CouchbaseKeyColumnValueStore> openStores;
@@ -81,91 +52,13 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     public CouchbaseStoreManager(org.janusgraph.diskstorage.configuration.Configuration config) throws BackendException {
         super(config, PORT_DEFAULT);
 
-        cluster = CouchbaseCluster.create(hostnames);
-        cluster.authenticate(username, password);
+        bucket = new BucketWrapper(config, hostnames, port, username, password);
+        bucket.ensureBucketExists();
 
-        this.bucketName = determineTableName(config);
-        this.ramQuotaMB = config.has(RAM_QUOTA_MB) ? config.get(RAM_QUOTA_MB) : 100;
-        bucketHelper = new BucketHelper(hostnames[0], port, username, password);
-        ensureBucketExists();
-
-//
-//        shortCfNameMap = createShortCfMap(config);
-//
-//        Preconditions.checkArgument(null != shortCfNameMap);
-//        Collection<String> shorts = shortCfNameMap.values();
-//        Preconditions.checkArgument(Sets.newHashSet(shorts).size() == shorts.size());
-//
-//        this.compression = config.get(COMPRESSION);
-//        this.regionCount = config.has(REGION_COUNT) ? config.get(REGION_COUNT) : -1;
-//        this.regionsPerServer = config.has(REGIONS_PER_SERVER) ? config.get(REGIONS_PER_SERVER) : -1;
-//        this.skipSchemaCheck = config.get(SKIP_SCHEMA_CHECK);
-//        final String compatClass = config.has(COMPAT_CLASS) ? config.get(COMPAT_CLASS) : null;
-//        this.compat = HBaseCompatLoader.getCompat(compatClass);
-//
-//        /*
-//         * Specifying both region count options is permitted but may be
-//         * indicative of a misunderstanding, so issue a warning.
-//         */
-//        if (config.has(REGIONS_PER_SERVER) && config.has(REGION_COUNT)) {
-//            logger.warn("Both {} and {} are set in JanusGraph's configuration, but "
-//                      + "the former takes precedence and the latter will be ignored.",
-//                        REGION_COUNT, REGIONS_PER_SERVER);
-//        }
-//
-//        /* This static factory calls HBaseConfiguration.addHbaseResources(),
-//         * which in turn applies the contents of hbase-default.xml and then
-//         * applies the contents of hbase-site.xml.
-//         */
-//        hconf = HBaseConfiguration.create();
-//
-//        // Copy a subset of our commons config into a Hadoop config
-//        int keysLoaded=0;
-//        Map<String,Object> configSub = config.getSubset(HBASE_CONFIGURATION_NAMESPACE);
-//        for (Map.Entry<String,Object> entry : configSub.entrySet()) {
-//            logger.info("HBase configuration: setting {}={}", entry.getKey(), entry.getValue());
-//            if (entry.getValue()==null) continue;
-//            hconf.set(entry.getKey(), entry.getValue().toString());
-//            keysLoaded++;
-//        }
-//
-//        logger.debug("HBase configuration: set a total of {} configuration values", keysLoaded);
-//
-//        // Special case for STORAGE_HOSTS
-//        if (config.has(GraphDatabaseConfiguration.STORAGE_HOSTS)) {
-//            String zkQuorumKey = "hbase.zookeeper.quorum";
-//            String csHostList = Joiner.on(",").join(config.get(GraphDatabaseConfiguration.STORAGE_HOSTS));
-//            hconf.set(zkQuorumKey, csHostList);
-//            logger.info("Copied host list from {} to {}: {}", GraphDatabaseConfiguration.STORAGE_HOSTS, zkQuorumKey, csHostList);
-//        }
-//
-//        // Special case for STORAGE_PORT
-//        if (config.has(GraphDatabaseConfiguration.STORAGE_PORT)) {
-//            String zkPortKey = "hbase.zookeeper.property.clientPort";
-//            Integer zkPort = config.get(GraphDatabaseConfiguration.STORAGE_PORT);
-//            hconf.set(zkPortKey, zkPort.toString());
-//            logger.info("Copied Zookeeper Port from {} to {}: {}", GraphDatabaseConfiguration.STORAGE_PORT, zkPortKey, zkPort);
-//        }
-//
-//        this.shortCfNames = config.get(SHORT_CF_NAMES);
-//
-//        try {
-//            //this.cnx = HConnectionManager.createConnection(hconf);
-//            this.cnx = compat.createConnection(hconf);
-//        } catch (IOException e) {
-//            throw new PermanentBackendException(e);
-//        }
-//
         if (logger.isTraceEnabled()) {
             openManagers.put(this, new Throwable("Manager Opened"));
             dumpOpenManagers();
         }
-//
-//        logger.debug("Dumping HBase config key=value pairs");
-//        for (Map.Entry<String, String> entry : hconf) {
-//            logger.debug("[HBaseConfig] " + entry.getKey() + "=" + entry.getValue());
-//        }
-//        logger.debug("End of HBase config key=value pairs");
 
         openStores = new ConcurrentHashMap<>();
     }
@@ -177,7 +70,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
     @Override
     public String toString() {
-        return "couchbase[" + bucketName + "@" + super.toString() + "]";
+        return "couchbase[" + bucket.getBucketName() + "@" + super.toString() + "]";
     }
 
     public void dumpOpenManagers() {
@@ -195,25 +88,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         if (logger.isTraceEnabled())
             openManagers.remove(this);
 
-        try {
-            if (bucket != null)
-                bucket.close();
-        } catch (Exception e) {
-            logger.warn("Failed closing bucket " + bucketName, e);
-        }
-
-        try {
-            if (cluster != null)
-                cluster.disconnect();
-        } catch (Exception e) {
-            logger.warn("Failed disconnecting cluster", e);
-        }
-
-        try {
-            bucketHelper.close();
-        } catch (IOException e) {
-            logger.warn("Failed closing bucketHelper", e);
-        }
+        bucket.close();
     }
 
     @Override
@@ -237,7 +112,8 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     }
 
     @Override
-    public void mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> batch, StoreTransaction txh) throws BackendException {
+    public void mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> batch, StoreTransaction txh)
+        throws BackendException {
         final MaskedTimestamp commitTime = new MaskedTimestamp(txh);
         final List<CouchbaseDocumentMutation> documentMutations = convertToDocumentMutations(batch);
 
@@ -250,9 +126,9 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
                     if (!columns.isEmpty()) {
                         updateColumns(document, columns);
-                        return bucket.async().upsert(document); // TODO add PersistTo and ReplicateTo
+                        return bucket.asyncUpsert(document);
                     } else
-                        return bucket.async().remove(document); // TODO add PersistTo and ReplicateTo
+                        return bucket.asyncRemove(document);
                 })
                 .last()
                 .toBlocking()
@@ -266,21 +142,26 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
     public void mutate(CouchbaseDocumentMutation docMutation, StoreTransaction txh) throws BackendException {
         final MaskedTimestamp commitTime = new MaskedTimestamp(txh);
-        final JsonDocument document = getMutatedDocument(docMutation);
-        final Map<String, CouchbaseColumn> columns = getMutatedColumns(docMutation, document);
 
-        if (!columns.isEmpty()) {
-            updateColumns(document, columns);
-            bucket.upsert(document); // TODO add PersistTo and ReplicateTo
-        } else
-            bucket.remove(document); // TODO add PersistTo and ReplicateTo
+        try {
+            final JsonDocument document = getMutatedDocument(docMutation);
+            final Map<String, CouchbaseColumn> columns = getMutatedColumns(docMutation, document);
+
+            if (!columns.isEmpty()) {
+                updateColumns(document, columns);
+                bucket.upsert(document);
+            } else
+                bucket.remove(document);
+        } catch (CouchbaseException e) {
+            throw new TemporaryBackendException(e);
+        }
 
         sleepAfterWrite(txh, commitTime);
     }
 
     private JsonDocument getMutatedDocument(CouchbaseDocumentMutation docMutation) {
         // we should get whole document to clean up expired columns otherwise we could mutate document's fragments
-        JsonDocument document = bucket.get(docMutation.getDocumentId()); // TODO add getAndLock option to enforce consistency
+        JsonDocument document = bucket.get(docMutation.getDocumentId());
 
         if (document == null)
             document = JsonDocument.create(
@@ -297,8 +178,8 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
                                                            JsonDocument document) {
         final long currentTimeMillis = currentTimeMillis();
 
-        Map<String, CouchbaseColumn> columns = getColumnsFromDocument(document, currentTimeMillis);
-        KCVMutation mutation = docMutation.getMutation();
+        final Map<String, CouchbaseColumn> columns = getColumnsFromDocument(document, currentTimeMillis);
+        final KCVMutation mutation = docMutation.getMutation();
 
         if (mutation.hasAdditions()) {
             for (Entry e : mutation.getAdditions()) {
@@ -357,16 +238,16 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
     }
 
     private List<CouchbaseDocumentMutation> convertToDocumentMutations(Map<String, Map<StaticBuffer, KCVMutation>> batch) {
-        List<CouchbaseDocumentMutation> documentMutations = new ArrayList<>();
+        final List<CouchbaseDocumentMutation> documentMutations = new ArrayList<>();
 
         for (Map.Entry<String, Map<StaticBuffer, KCVMutation>> batchEntry : batch.entrySet()) {
-            String table = batchEntry.getKey();
+            final String table = batchEntry.getKey();
             Preconditions.checkArgument(openStores.containsKey(table), "Table cannot be found: " + table);
 
-            Map<StaticBuffer, KCVMutation> mutations = batchEntry.getValue();
+            final Map<StaticBuffer, KCVMutation> mutations = batchEntry.getValue();
             for (Map.Entry<StaticBuffer, KCVMutation> ent : mutations.entrySet()) {
-                KCVMutation mutation = ent.getValue();
-                String id = columnConverter.toString(ent.getKey());
+                final KCVMutation mutation = ent.getValue();
+                final String id = columnConverter.toString(ent.getKey());
                 documentMutations.add(new CouchbaseDocumentMutation(table, id, mutation));
             }
         }
@@ -383,13 +264,17 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         CouchbaseKeyColumnValueStore store = openStores.get(name);
 
         if (store == null) {
-            CouchbaseKeyColumnValueStore newStore = new CouchbaseKeyColumnValueStore(this, bucketName,
-                name, bucket);
+            final CouchbaseKeyColumnValueStore newStore = new CouchbaseKeyColumnValueStore(this,
+                bucket.getBucketName(), name, bucket);
 
             store = openStores.putIfAbsent(name, newStore);
 
             if (store == null) {
-                ensureBucketExists();
+                try {
+                    bucket.ensureBucketExists();
+                } catch (CouchbaseException e) {
+                    throw new TemporaryBackendException(e);
+                }
                 store = newStore;
             }
         }
@@ -404,7 +289,7 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
 
     @Override
     public String getName() {
-        return bucketName;
+        return bucket.getBucketName();
     }
 
     /**
@@ -412,21 +297,23 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
      */
     @Override
     public void clearStorage() throws BackendException {
-        logger.info("clearStorage");
-        if (this.storageConfig.get(GraphDatabaseConfiguration.DROP_ON_CLEAR)) {
-            bucketHelper.drop(bucketName);
-        } else { // TODO replace to truncate
-            try {
-                bucket.query(deleteFrom(bucketName));
-            } catch (CouchbaseException e) {
-                throw new TemporaryBackendException(e);
-            }
+        try {
+            if (this.storageConfig.get(GraphDatabaseConfiguration.DROP_ON_CLEAR))
+                bucket.dropBucket();
+            else
+                bucket.truncateBucket();
+        } catch (CouchbaseException e) {
+            throw new TemporaryBackendException(e);
         }
     }
 
     @Override
     public boolean exists() throws BackendException {
-        return bucketHelper.exists(bucketName);
+        try {
+            return bucket.bucketExists();
+        } catch (CouchbaseException e) {
+            throw new TemporaryBackendException(e);
+        }
     }
 
     @Override
@@ -434,28 +321,5 @@ public class CouchbaseStoreManager extends DistributedStoreManager implements Ke
         throw new UnsupportedOperationException();
     }
 
-    private void ensureBucketExists() throws BackendException {
-        logger.info("ensureBucketExists");
-        if (!exists())
-            createBucket();
-        else if (bucket == null)
-            bucket = cluster.openBucket(bucketName);
-    }
-
-    private void createBucket() throws BackendException {
-        // TODO put params to config
-        bucketHelper.create(bucketName, "couchbase", ramQuotaMB);
-        bucket = cluster.openBucket(bucketName);
-        N1qlQueryResult res = bucket.query(N1qlQuery.simple("CREATE PRIMARY INDEX `" + bucketName + "_primary` ON `" +
-            bucketName + "` WITH { \"defer_build\":false }"));
-        //       logger.info("Create index res = " + res.status());
-    }
-
-    private String determineTableName(org.janusgraph.diskstorage.configuration.Configuration config) {
-        if ((!config.has(COUCHBASE_BUCKET)) && (config.has(GRAPH_NAME))) {
-            return config.get(GRAPH_NAME);
-        }
-        return config.get(COUCHBASE_BUCKET);
-    }
 
 }

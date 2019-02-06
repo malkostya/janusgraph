@@ -1,5 +1,6 @@
 package org.janusgraph.diskstorage.couchbase;
 
+import com.couchbase.client.core.CouchbaseException;
 import org.apache.http.HttpHost;
 import org.apache.http.NameValuePair;
 import org.apache.http.StatusLine;
@@ -18,8 +19,6 @@ import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.message.BasicNameValuePair;
-import org.janusgraph.diskstorage.BackendException;
-import org.janusgraph.diskstorage.TemporaryBackendException;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -45,11 +44,15 @@ public class BucketHelper {
         url = httpHost.toURI() + "/pools/default/buckets";
     }
 
-    public void close() throws IOException {
-        httpclient.close();
+    public void close() {
+        try {
+            httpclient.close();
+        } catch (IOException e) {
+            throw new CouchbaseException(e);
+        }
     }
 
-    public void create(String bucketName, String bucketType, int ramQuotaMB) throws BackendException {
+    public void create(String bucketName, String bucketType, int ramQuotaMB) {
         final HttpPost httpPost = new HttpPost(url);
         final List<NameValuePair> params = new ArrayList<>(3);
 
@@ -61,7 +64,7 @@ public class BucketHelper {
             httpPost.addHeader(new BasicScheme().authenticate(credentials, httpPost, null));
             httpPost.setEntity(new UrlEncodedFormEntity(params));
 
-            try(final CloseableHttpResponse response = httpclient.execute(httpPost)) {
+            try (final CloseableHttpResponse response = httpclient.execute(httpPost)) {
                 final StatusLine statusLine = response.getStatusLine();
 
                 if (statusLine.getStatusCode() == 202)
@@ -70,13 +73,13 @@ public class BucketHelper {
                     throw new IOException(statusLine.toString());
             }
         } catch (IOException e) {
-            throw new TemporaryBackendException(e);
+            throw new CouchbaseException(e);
         } catch (AuthenticationException e) {
-            throw new TemporaryBackendException(e);
+            throw new CouchbaseException(e);
         }
     }
 
-    public boolean exists(String bucketName) throws BackendException {
+    public boolean exists(String bucketName) {
         final HttpGet httpGet = new HttpGet(url + "/" + bucketName);
 
         try (final CloseableHttpResponse response = httpclient.execute(httpGet)) {
@@ -89,11 +92,11 @@ public class BucketHelper {
             else
                 throw new IOException(statusLine.toString());
         } catch (IOException e) {
-            throw new TemporaryBackendException(e);
+            throw new CouchbaseException(e);
         }
     }
 
-    public void drop(String bucketName) throws BackendException {
+    public void drop(String bucketName) {
         final HttpDelete httpDelete = new HttpDelete(url + "/" + bucketName);
 
         try (final CloseableHttpResponse response = httpclient.execute(httpDelete)) {
@@ -104,7 +107,7 @@ public class BucketHelper {
             else
                 throw new IOException(statusLine.toString());
         } catch (IOException e) {
-            throw new TemporaryBackendException(e);
+            throw new CouchbaseException(e);
         }
     }
 

@@ -18,6 +18,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
+import org.janusgraph.diskstorage.couchbase.BucketWrapper;
 import org.janusgraph.diskstorage.couchbase.CouchbaseStoreManager;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.slf4j.Logger;
@@ -94,7 +95,7 @@ public class CouchbaseStorageSetup {
         config.set(GraphDatabaseConfiguration.AUTH_USERNAME, DEFAULT_USERNAME);
         config.set(GraphDatabaseConfiguration.AUTH_PASSWORD, DEFAULT_PASSWORD);
         config.set(GraphDatabaseConfiguration.STORAGE_BACKEND, "couchbase");
-        if (!StringUtils.isEmpty(bucketName)) config.set(CouchbaseStoreManager.COUCHBASE_BUCKET, bucketName);
+        if (!StringUtils.isEmpty(bucketName)) config.set(BucketWrapper.COUCHBASE_BUCKET, bucketName);
         if (!StringUtils.isEmpty(graphName)) config.set(GraphDatabaseConfiguration.GRAPH_NAME, graphName);
         config.set(GraphDatabaseConfiguration.TIMESTAMP_PROVIDER, CouchbaseStoreManager.PREFERRED_TIMESTAMPS);
         config.set(GraphDatabaseConfiguration.DROP_ON_CLEAR, false);
@@ -129,10 +130,6 @@ public class CouchbaseStorageSetup {
 //        return HBASE;
     }
 
-    /**
-     * Check whether {@link #HBASE_STAT_FILE} describes an HBase daemon. If so,
-     * kill it. Otherwise, do nothing.
-     */
     public synchronized static void killIfRunning() {
 //        HBaseStatus stat = HBaseStatus.read(HBASE_STAT_FILE);
 //
@@ -197,13 +194,6 @@ public class CouchbaseStorageSetup {
 //        Runtime.getRuntime().addShutdownHook(new Thread(() -> shutdownCouchbase(stat)));
 //    }
 
-    /**
-     * Runs the {@code hbase-daemon.sh stop master} script corresponding to the
-     * HBase version described by the parameter.
-     *
-     * @param stat
-     *            the running HBase daemon to stop
-     */
     private synchronized static void shutdownCouchbase(){//HBaseStatus stat) {
 //
 //        log.info("Shutting down HBase...");

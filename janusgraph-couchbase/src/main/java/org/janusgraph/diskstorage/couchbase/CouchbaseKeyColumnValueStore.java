@@ -1,7 +1,6 @@
 package org.janusgraph.diskstorage.couchbase;
 
 import com.couchbase.client.core.CouchbaseException;
-import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.document.json.JsonArray;
 import com.couchbase.client.java.document.json.JsonObject;
 import com.couchbase.client.java.query.N1qlParams;
@@ -25,12 +24,15 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     private static final Logger logger = LoggerFactory.getLogger(CouchbaseKeyColumnValueStore.class);
     private static final CouchbaseColumnConverter columnConverter = CouchbaseColumnConverter.INSTANCE;
     private final String bucketName;
-    private final Bucket bucket;
+    private final BucketWrapper bucket;
     private final CouchbaseStoreManager storeManager;
     private final CouchbaseGetter entryGetter;
     private final String table;
 
-    CouchbaseKeyColumnValueStore(CouchbaseStoreManager storeManager, String bucketName, String table, Bucket bucket) {
+    CouchbaseKeyColumnValueStore(CouchbaseStoreManager storeManager,
+                                 String bucketName,
+                                 String table,
+                                 BucketWrapper bucket) {
         this.storeManager = storeManager;
         this.bucketName = bucketName;
         this.bucket = bucket;
@@ -41,19 +43,6 @@ public class CouchbaseKeyColumnValueStore implements KeyColumnValueStore {
     @Override
     public void close() {
     }
-
-//    public static void main(String[] args) {
-//
-//
-//        byte[] b = new byte[]{
-//            0, 0, 0, 0, 0, 0, 3, -24
-//        };
-//        String s = columnConverter.toString(b);
-//        System.out.println(s);
-//        byte[] b1 = columnConverter.toByteArray(s);
-//
-//        System.out.println(b1);
-//    }
 
     @Override
     public EntryList getSlice(KeySliceQuery query, StoreTransaction txh) throws BackendException {
